@@ -90,6 +90,21 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   overlapping object ids, confirmed to fail 12/12 without the fix) and a
   constellation test of 6 peers pushing into one server at once, one record large
   enough to be segmented on the wire.
+- Phase 5 Constellation mDNS LAN discovery (`discovery` feature, on by default):
+  find a peer of your identity on a LAN with no host:port typed in. A serving
+  device advertises a DNS-SD service (`_horizon-cstl._udp`) carrying a short,
+  non-secret fingerprint derived one-way from the identity master under its own
+  domain separator, so it leaks neither the master nor the Lifestream/Noise keys.
+  A peer browses, matches the fingerprint, and dials the resolved address. The
+  fingerprint is only a rendezvous label; authentication is still the Noise
+  NNpsk0 handshake, so broadcasting it grants nothing (a wrong identity that
+  reads it still cannot connect). Beacon is RAII, dropping it withdraws the
+  announcement. Unit tests cover the fingerprint (stable, identity-specific,
+  distinct from the auth key); a live multicast roundtrip is #[ignore]d for CI
+  (multicast is unreliable in the sandbox) and was verified on darwin, including
+  an end-to-end CLI push to a discovered peer. CLI: `constellation serve`
+  announces unless --no-announce, and `constellation sync <store> --discover`
+  finds a peer instead of taking an address. Slim builds turn `discovery` off.
 
 ## Next
 
@@ -101,10 +116,10 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   audit/grants` is the headless stand-in until then.
 - Phase 3: shell + Wayland compositor (Smithay/iced). Linux-only.
 - Phase 5 Constellation discovery and NAT traversal: the QUIC + Noise transport,
-  its serve/sync CLI, and concurrent multi-peer serving are done and loopback-
-  tested on darwin. What remains is finding peers without a hardcoded host:port
-  (mDNS on a LAN, a rendezvous or relay for the open internet) and hole punching
-  through NAT. Real-host and network work.
+  its serve/sync CLI, concurrent multi-peer serving, and mDNS LAN discovery are
+  done and tested on darwin. What remains is reaching peers beyond the LAN: a
+  rendezvous or relay for the open internet and hole punching through NAT, plus
+  bridging discovery across subnets. Real-host and network work.
 - Phase 5 Reconstitution boot/identity wiring: bind recovery shares to FIDO2
   re-enrollment and the boot-time unlock path, and a phone as a post-boot trusted
   device. Linux-only; the secret-sharing core and CLI are done and cross-platform.

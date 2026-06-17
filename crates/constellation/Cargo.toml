@@ -9,20 +9,25 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
-default = ["net"]
+default = ["net", "discovery"]
 # The QUIC + Noise network skin. A default off build keeps the sync core and its
 # dependency footprint minimal (e.g. a slim Key build); CI exercises the feature.
 net = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:snow", "dep:tokio", "dep:blake3"]
+# mDNS LAN peer discovery. Independent of net (it only needs the identity master
+# to derive a fingerprint), but useful alongside it: find a peer to dial.
+discovery = ["dep:mdns-sd", "dep:blake3", "dep:hex"]
 
 [dependencies]
 lifestream = { path = "../lifestream" }
 thiserror.workspace = true
 blake3 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 rcgen = { version = "0.13", optional = true }
 snow = { version = "0.9", optional = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "sync", "io-util", "time", "net"], optional = true }
+mdns-sd = { version = "0.20", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

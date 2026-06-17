@@ -14,7 +14,9 @@
 //!
 //! This is the in-process core. The network skin lives in [`net`] (enabled by
 //! the default `net` feature): a QUIC + Noise link that implements the same
-//! [`Transport`] trait, so the algorithm here does not change.
+//! [`Transport`] trait, so the algorithm here does not change. Finding a peer to
+//! dial on a LAN, without typing a host:port, lives in [`discovery`] (the default
+//! `discovery` feature).
 
 mod error;
 mod transport;
@@ -22,11 +24,17 @@ mod transport;
 #[cfg(feature = "net")]
 pub mod net;
 
+#[cfg(feature = "discovery")]
+pub mod discovery;
+
 pub use error::{Error, Result};
 pub use transport::{LocalTransport, Transport};
 
 #[cfg(feature = "net")]
 pub use net::{NetworkTransport, Server};
+
+#[cfg(feature = "discovery")]
+pub use discovery::{discover, fingerprint, Beacon};
 
 use std::collections::HashSet;
 

@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -59,12 +59,18 @@ enum ConstellationOp {
         /// Address to listen on (host:port)
         #[arg(long, default_value = "0.0.0.0:7777")]
         listen: String,
+        /// Do not announce this server to peers on the LAN over mDNS
+        #[arg(long)]
+        no_announce: bool,
     },
     /// Sync with a peer that is serving the same identity
     Sync {
         store: PathBuf,
-        /// Peer address (host:port)
-        peer: String,
+        /// Peer address (host:port); omit and pass --discover to find one on the LAN
+        peer: Option<String>,
+        /// Find a peer of this identity on the LAN over mDNS instead of an address
+        #[arg(long)]
+        discover: bool,
         /// Push local -> peer instead of the default pull
         #[arg(long)]
         push: bool,
@@ -444,30 +450,58 @@ fn print_report(from: &str, to: &str, r: &SyncReport) {
 }
 
 // Constellation over the network. `serve` opens this store and answers peers
-// that prove the same identity through the Noise handshake; `sync` dials such a
-// peer and runs the same diff-and-ship the in-process sync runs, only the far
-// transport is a QUIC link. Direction defaults to pull (bring the peer's
-// objects here); --push reverses it and --both converges the two.
+// that prove the same identity through the Noise handshake, and (unless
+// --no-announce) advertises itself on the LAN over mDNS so a peer can find it
+// without a typed address. `sync` dials such a peer (given as host:port, or
+// found with --discover) and runs the same diff-and-ship the in-process sync
+// runs, only the far transport is a QUIC link. Direction defaults to pull (bring
+// the peer's objects here); --push reverses it and --both converges the two.
 fn constellation_cmd(op: ConstellationOp) -> Result<()> {
     match op {
-        ConstellationOp::Serve { store, listen } => {
+        ConstellationOp::Serve {
+            store,
+            listen,
+            no_announce,
+        } => {
             let key = master_key(&store)?;
             let ls = Lifestream::open(&store, &key).context("open store (wrong passphrase?)")?;
             let addr: SocketAddr = listen.parse().context("parse --listen host:port")?;
             let server = Server::start(addr, key, ls)?;
-            println!("serving {} on {}", store.display(), server.local_addr());
+            let local = server.local_addr();
+            println!("serving {} on {}", store.display(), local);
+            // Hold the beacon for the life of the process so the announcement
+            // stays up; it withdraws when serve exits.
+            let _beacon = if no_announce {
+                None
+            } else {
+                match constellation::Beacon::announce(&key, local.port()) {
+                    Ok(b) => {
+                        eprintln!(
+                            "announcing on the LAN as {}",
+                            constellation::fingerprint(&key)
+                        );
+                        Some(b)
+                    }
+                    Err(e) => {
+                        eprintln!("mDNS announce failed, serving without it: {e}");
+                        None
+                    }
+                }
+            };
             eprintln!("peers must prove the same identity; ctrl-c to stop");
             server.wait();
         }
         ConstellationOp::Sync {
             store,
             peer,
+            discover,
             push,
             both,
         } => {
             let key = master_key(&store)?;
             let ls = Lifestream::open(&store, &key).context("open store (wrong passphrase?)")?;
-            let addr: SocketAddr = peer.parse().context("parse peer host:port")?;
+            let addr = resolve_peer(peer, discover, &key)?;
+            let peer = addr.to_string();
             let remote = NetworkTransport::connect(addr, key)
                 .context("connect to peer (same identity/passphrase?)")?;
             let local = LocalTransport::new(ls);
@@ -484,6 +518,34 @@ fn constellation_cmd(op: ConstellationOp) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// Where to dial: an explicit host:port wins; otherwise --discover browses the
+// LAN over mDNS for a peer of this identity and takes the first one found.
+fn resolve_peer(peer: Option<String>, discover: bool, key: &[u8; 32]) -> Result<SocketAddr> {
+    if let Some(p) = peer {
+        return p.parse().context("parse peer host:port");
+    }
+    if !discover {
+        return Err(anyhow!(
+            "give a peer address, or pass --discover to find one"
+        ));
+    }
+    eprintln!("searching the LAN for a peer of this identity...");
+    let found = constellation::discover(key, Duration::from_secs(3))?;
+    let mut iter = found.into_iter();
+    match iter.next() {
+        Some(addr) => {
+            let extra = iter.count();
+            if extra > 0 {
+                eprintln!("found {} peers; using {addr}", extra + 1);
+            } else {
+                eprintln!("found peer at {addr}");
+            }
+            Ok(addr)
+        }
+        None => Err(anyhow!("no peer of this identity found on the LAN")),
+    }
 }
 
 // Reconstitution. split turns the store's master key into recovery shares you

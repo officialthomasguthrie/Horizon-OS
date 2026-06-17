@@ -77,6 +77,19 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   of the same identity until stopped; `sync <store> <peer> [--push] [--both]`
   dials a serving peer and runs the sync, default pull, --push to send, --both to
   converge the two stores.
+- Concurrent-writer safety in the Lifestream store, so the Constellation server
+  is safe to serve several peers at once. The store published every record
+  through one fixed temp file (`<id>.tmp`) before renaming it into place; two
+  peers pushing the same object id at once raced on that single temp file and
+  could rename a half-written record or hit a vanished-temp rename error. Each
+  write now uses a temp name unique to the writer (pid plus a process-global
+  counter) before the atomic rename, so concurrent writers never collide; content
+  addressing means whichever writer lands last leaves a valid record. The server
+  already spawned a task per connection over one shared store, so this is what
+  makes that safe. Tests: a lifestream concurrency test (8 threads racing
+  overlapping object ids, confirmed to fail 12/12 without the fix) and a
+  constellation test of 6 peers pushing into one server at once, one record large
+  enough to be segmented on the wire.
 
 ## Next
 
@@ -87,12 +100,11 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   the shell in Phase 3 (it is an L5 compositor surface); `horizon weave
   audit/grants` is the headless stand-in until then.
 - Phase 3: shell + Wayland compositor (Smithay/iced). Linux-only.
-- Phase 5 Constellation discovery and NAT traversal: the QUIC + Noise transport
-  and its serve/sync CLI are done and loopback-tested on darwin. What remains is
-  finding peers without a hardcoded host:port (mDNS on a LAN, a rendezvous or
-  relay for the open internet) and hole punching through NAT, plus serving more
-  than one peer at a time safely (the store's temp-file writes assume a single
-  writer). Real-host and network work.
+- Phase 5 Constellation discovery and NAT traversal: the QUIC + Noise transport,
+  its serve/sync CLI, and concurrent multi-peer serving are done and loopback-
+  tested on darwin. What remains is finding peers without a hardcoded host:port
+  (mDNS on a LAN, a rendezvous or relay for the open internet) and hole punching
+  through NAT. Real-host and network work.
 - Phase 5 Reconstitution boot/identity wiring: bind recovery shares to FIDO2
   re-enrollment and the boot-time unlock path, and a phone as a post-boot trusted
   device. Linux-only; the secret-sharing core and CLI are done and cross-platform.

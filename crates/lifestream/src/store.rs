@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::crypto::Keys;
 use crate::error::{Error, Result};
@@ -8,6 +9,11 @@ use crate::object::ObjectId;
 
 const MARKER_NAME: &str = "store";
 const MARKER_BODY: &str = "horizon-lifestream v1\n";
+
+// Distinguishes concurrent writers' temp files. A process-global counter plus
+// the pid keeps every in-flight temp name unique, even across two processes
+// writing one store, so no two writers ever share a temp path.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // Flat on-disk object store. Objects live at objects/<2 hex>/<rest>, refs are
 // small text files under refs/. The store never sees plaintext: put/get seal
@@ -65,10 +71,7 @@ impl ObjectStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        // write to a temp file then rename so a reader never sees a half record
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, &record)?;
-        fs::rename(&tmp, &path)?;
+        commit_record(&path, &record)?;
         Ok(id)
     }
 
@@ -122,9 +125,7 @@ impl ObjectStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, record)?;
-        fs::rename(&tmp, &path)?;
+        commit_record(&path, record)?;
         Ok(true)
     }
 
@@ -169,4 +170,20 @@ impl ObjectStore {
         }
         Ok(out)
     }
+}
+
+// Publish a sealed record at `path` atomically: write it to a temp file in the
+// same directory, then rename into place, so a reader sees either the whole
+// record or nothing. The temp name carries the pid and a process-global counter,
+// so two writers committing the same object at once never share one temp file.
+// Rename is atomic, and because the id is a keyed hash of the plaintext every
+// writer's record opens to the same object, so whichever writer renames last the
+// file left in place is always a valid record for this id. The temp name ends in
+// .tmp so list_ids skips any that a crash leaves behind.
+fn commit_record(path: &Path, record: &[u8]) -> Result<()> {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), seq));
+    fs::write(&tmp, record)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }

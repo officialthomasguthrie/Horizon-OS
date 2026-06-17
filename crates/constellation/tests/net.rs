@@ -128,6 +128,84 @@ fn pull_replicates_from_a_remote_server() {
     drop(server);
 }
 
+// Several peers push into one Server at the same time. The server spawns a task
+// per connection over a single shared store, so concurrent peers writing the
+// same object ids land on the store's concurrent-write path. Nothing should be
+// lost or corrupted: the store ends with the union of every peer's objects, each
+// still decryptable.
+#[test]
+fn serves_several_peers_at_once() {
+    use std::sync::Arc;
+    use std::thread;
+
+    const PEERS: usize = 6;
+    const SHARED: usize = 20;
+    const UNIQUE: usize = 2;
+
+    // Distinct shared payloads (every peer holds these, so they race to write the
+    // same ids), with one oversized so its record must segment on the wire while
+    // several peers push it at once.
+    let shared: Arc<Vec<Vec<u8>>> = Arc::new(
+        (0..SHARED)
+            .map(|i| {
+                if i == 0 {
+                    varied(200_000)
+                } else {
+                    varied(8_000 + i * 137)
+                }
+            })
+            .collect(),
+    );
+
+    // The far side starts empty and receives from every peer concurrently.
+    let db = tempdir().unwrap();
+    let server = Server::start(loopback(), KEY, store(&db, &KEY)).unwrap();
+    let addr = server.local_addr();
+
+    let mut handles = Vec::new();
+    for p in 0..PEERS {
+        let shared = shared.clone();
+        handles.push(thread::spawn(move || {
+            let dir = tempdir().unwrap();
+            let local = LocalTransport::new(Lifestream::init(dir.path(), &KEY).unwrap());
+            for payload in shared.iter() {
+                local
+                    .lifestream()
+                    .put(&Object::Chunk(payload.clone()))
+                    .unwrap();
+            }
+            for j in 0..UNIQUE {
+                local
+                    .lifestream()
+                    .put(&Object::Chunk(format!("peer-{p}-uniq-{j}").into_bytes()))
+                    .unwrap();
+            }
+            let remote = NetworkTransport::connect(addr, KEY).unwrap();
+            sync(&local, &remote).unwrap();
+            remote.close().ok();
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Read the server's store fresh from disk: it holds the union of every peer's
+    // objects, each decryptable, with nothing dropped or corrupted.
+    let b = Lifestream::open(db.path(), &KEY).unwrap();
+    assert_eq!(b.object_count().unwrap(), SHARED + PEERS * UNIQUE);
+
+    let refdir = tempdir().unwrap();
+    let reference = Lifestream::init(refdir.path(), &KEY).unwrap();
+    for payload in shared.iter() {
+        let id = reference.put(&Object::Chunk(payload.clone())).unwrap();
+        match b.get(&id).unwrap() {
+            Object::Chunk(bytes) => assert_eq!(&bytes, payload),
+            _ => panic!("wrong object kind on server"),
+        }
+    }
+    drop(server);
+}
+
 // A wrong identity cannot even connect: the Noise handshake fails on the first
 // message, so the peer is turned away before any object moves.
 #[test]

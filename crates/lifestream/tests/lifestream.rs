@@ -151,6 +151,58 @@ fn gc_keeps_reachable_drops_garbage() {
 }
 
 #[test]
+fn concurrent_writers_converge() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let d = tempdir().unwrap();
+    let ls = Arc::new(Lifestream::init(d.path(), &KEY).unwrap());
+
+    const THREADS: usize = 8;
+    const SHARED: usize = 24;
+
+    // Payloads every thread writes, so all THREADS race to create the same object
+    // ids at once: the case a single fixed temp-file name used to corrupt. Odd
+    // seeds keep them distinct (pseudo ORs the low bit in, folding seed 2k onto
+    // 2k+1).
+    let shared: Arc<Vec<Vec<u8>>> = Arc::new(
+        (0..SHARED)
+            .map(|i| pseudo(i as u64 * 2 + 1, 4096))
+            .collect(),
+    );
+
+    let mut handles = Vec::new();
+    for t in 0..THREADS {
+        let ls = ls.clone();
+        let shared = shared.clone();
+        handles.push(thread::spawn(move || {
+            for p in shared.iter() {
+                ls.put(&Object::Chunk(p.clone())).unwrap();
+            }
+            // one object only this thread writes, so distinct writes race too
+            ls.put(&Object::Chunk(format!("unique-{t}").into_bytes()))
+                .unwrap();
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Every shared payload is stored exactly once and opens back to its bytes.
+    for p in shared.iter() {
+        let id = ls.put(&Object::Chunk(p.clone())).unwrap();
+        match ls.get(&id).unwrap() {
+            Object::Chunk(b) => assert_eq!(&b, p),
+            _ => panic!("wrong object kind"),
+        }
+    }
+
+    // The shared set plus one object per thread, with no duplicates and no
+    // half-written temp files counted as objects.
+    assert_eq!(ls.object_count().unwrap(), SHARED + THREADS);
+}
+
+#[test]
 fn wrong_key_cannot_read() {
     let d = tempdir().unwrap();
     let ls = Lifestream::init(d.path(), &[1u8; 32]).unwrap();

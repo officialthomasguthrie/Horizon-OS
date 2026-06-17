@@ -536,9 +536,11 @@ fn resolve_peer(peer: Option<String>, discover: bool, key: &[u8; 32]) -> Result<
     let mut iter = found.into_iter();
     match iter.next() {
         Some(addr) => {
+            // Each entry is an address, and one peer can resolve to several (a
+            // loopback and a LAN address, say), so report addresses, not peers.
             let extra = iter.count();
             if extra > 0 {
-                eprintln!("found {} peers; using {addr}", extra + 1);
+                eprintln!("found {} addresses; dialing {addr}", extra + 1);
             } else {
                 eprintln!("found peer at {addr}");
             }

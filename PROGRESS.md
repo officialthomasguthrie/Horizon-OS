@@ -45,6 +45,15 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
 - horizon sync CLI: `horizon sync <from> <to> [--both]`. Creates the destination
   as a replica of the source identity when absent, refuses a foreign one, and
   reports objects moved and refs set / advanced / diverged.
+- Phase 5 reconstitution crate: Shamir k-of-n recovery of the identity master
+  key over GF(2^8). split turns the key into n shares (any k rebuild it, any k-1
+  reveal nothing); combine interpolates back and verifies the result against a
+  domain-separated tag carried on every share, so a corrupted or wrong-set share
+  is caught instead of silently returning a wrong key. Shares are versioned,
+  self-describing, and hex-portable. 11 tests passing, including every k-subset.
+- horizon reconstitute CLI: `split <store> --k --n` cuts recovery shares from a
+  store's master key; `open <store> --share ...` rebuilds the key from k shares
+  and opens the store with no passphrase, decrypting HEAD to prove the key.
 
 ## Next
 
@@ -59,6 +68,6 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   same Transport trait the in-process sync already runs on, with peer discovery
   and NAT traversal. Network/Linux-host work; the sync core and CLI are done and
   cross-platform.
-- Phase 5 Reconstitution: Shamir/SLIP-39 k-of-n identity recovery and a second
-  FIDO2 enrollment. The secret-sharing core is cross-platform and a good next
-  cross-platform piece; FIDO2 and boot integration are Linux-only.
+- Phase 5 Reconstitution boot/identity wiring: bind recovery shares to FIDO2
+  re-enrollment and the boot-time unlock path, and a phone as a post-boot trusted
+  device. Linux-only; the secret-sharing core and CLI are done and cross-platform.

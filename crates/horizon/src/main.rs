@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use constellation::{LocalTransport, SyncReport};
 use lifestream::{Lifestream, Object, ObjectId};
+use reconstitution::Share;
 use weave::{Broker, Event, GrantId, Limits, Resource, Rights};
 
 #[derive(Parser)]
@@ -36,6 +37,30 @@ enum Cmd {
         /// Also pull the destination back, so both stores end up matching
         #[arg(long)]
         both: bool,
+    },
+    /// Split or recover a store's master key with k-of-n shares
+    Reconstitute {
+        #[command(subcommand)]
+        op: ReconOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReconOp {
+    /// Split this store's master key into n shares, any k of which recover it
+    Split {
+        store: PathBuf,
+        #[arg(long)]
+        k: u8,
+        #[arg(long)]
+        n: u8,
+    },
+    /// Recover access to a store from k shares, without the passphrase
+    Open {
+        store: PathBuf,
+        /// A recovery share in hex; pass --share once per share
+        #[arg(long = "share", required = true)]
+        shares: Vec<String>,
     },
 }
 
@@ -118,6 +143,7 @@ fn main() -> Result<()> {
         Cmd::Lifestream { op } => lifestream_cmd(op),
         Cmd::Weave { op } => weave_cmd(op),
         Cmd::Sync { from, to, both } => sync_cmd(from, to, both),
+        Cmd::Reconstitute { op } => recon_cmd(op),
     }
 }
 
@@ -385,6 +411,53 @@ fn print_sync(from: &Path, to: &Path, r: &SyncReport) {
     for name in &r.refs_conflicted {
         println!("  ref {name} diverged, left unchanged");
     }
+}
+
+// Reconstitution. split turns the store's master key into recovery shares you
+// spread across people and places; open rebuilds the key from any k of them and
+// opens the store with it, the path back in when the passphrase and FIDO2 are
+// gone. The on-disk store is unchanged either way; only the key is split or
+// rebuilt.
+fn recon_cmd(op: ReconOp) -> Result<()> {
+    match op {
+        ReconOp::Split { store, k, n } => {
+            let salt =
+                std::fs::read(store.join("keysalt")).context("read keysalt (is this a store?)")?;
+            let key = derive(&passphrase()?, &salt);
+            // Confirm the passphrase before splitting, so shares cannot be cut
+            // from a key that does not open this store.
+            Lifestream::open(&store, &key).context("open store (wrong passphrase?)")?;
+            let shares = reconstitution::split(&key, k, n).map_err(|e| anyhow!("{e}"))?;
+            eprintln!("{n} shares, any {k} recover. keep them apart:");
+            for s in shares {
+                println!("{}", s.to_hex());
+            }
+        }
+        ReconOp::Open { store, shares } => {
+            let parsed = shares
+                .iter()
+                .map(|s| Share::from_hex(s).map_err(|e| anyhow!("bad share: {e}")))
+                .collect::<Result<Vec<_>>>()?;
+            let recovered = reconstitution::combine(&parsed).map_err(|e| anyhow!("{e}"))?;
+            let key: [u8; 32] = recovered
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("recovered secret is not a 32-byte key"))?;
+            let ls = Lifestream::open(&store, &key).context("open store with recovered key")?;
+            // Decrypt HEAD to prove the rebuilt key really is this store's.
+            if let Some(h) = ls.head()? {
+                ls.get(&h)
+                    .context("recovered key did not decrypt the store")?;
+            }
+            println!("recovered access to {}", store.display());
+            println!("objects: {}", ls.object_count()?);
+            match ls.head()? {
+                Some(h) => println!("head:    {h}"),
+                None => println!("head:    none"),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn print_audit(b: &Broker) -> Result<()> {

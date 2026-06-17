@@ -21,11 +21,13 @@
 //! transport envelope (see [`tls`]).
 
 mod noise;
+pub mod punch;
 pub mod relay;
 pub mod rendezvous;
 mod tls;
 mod wire;
 
+pub use punch::PunchListener;
 pub use relay::{Relay, RelayBinding};
 pub use rendezvous::{Rendezvous, RendezvousClient, RendezvousRegistration};
 
@@ -96,6 +98,18 @@ impl Server {
         relay::bind(relay_addr, self.master, self.transport.clone())
     }
 
+    // Also make this identity's store reachable by UDP hole punching, brokered by
+    // the rendezvous at `rendezvous_addr`. A peer that cannot dial the direct
+    // endpoint can ask the rendezvous to broker a punch, opening a direct path
+    // that avoids relaying the sync. The returned handle keeps the peer waiting to
+    // be punched; dropping it withdraws the wait. The direct endpoint keeps
+    // serving regardless. This is the optimisation tried before the relay; the
+    // relay remains the fallback when a punch cannot open a path (a symmetric NAT,
+    // say).
+    pub fn punch_via_rendezvous(&self, rendezvous_addr: SocketAddr) -> Result<PunchListener> {
+        punch::listen(rendezvous_addr, self.master, self.transport.clone())
+    }
+
     // Block the calling thread while the server keeps serving in the background.
     // The CLI uses this; a SIGINT (ctrl-c) ends the process.
     pub fn wait(&self) -> ! {
@@ -111,7 +125,15 @@ impl Drop for Server {
     }
 }
 
-async fn accept_loop(endpoint: quinn::Endpoint, master: [u8; 32], transport: Arc<LocalTransport>) {
+// Accept and serve inbound connections on `endpoint` for `master`'s identity.
+// The direct server runs this, and so does a punch listener over the socket it
+// is punched on (see [`punch`]), since a punched dialer arrives as an ordinary
+// inbound connection.
+pub(super) async fn accept_loop(
+    endpoint: quinn::Endpoint,
+    master: [u8; 32],
+    transport: Arc<LocalTransport>,
+) {
     while let Some(incoming) = endpoint.accept().await {
         let transport = transport.clone();
         tokio::spawn(async move {
@@ -250,6 +272,20 @@ impl NetworkTransport {
     // moves.
     pub fn connect_via_relay(relay_addr: SocketAddr, master: [u8; 32]) -> Result<NetworkTransport> {
         relay::connect(relay_addr, master)
+    }
+
+    // Connect to a serving peer by UDP hole punching, brokered by the rendezvous
+    // at `rendezvous_addr`, instead of dialing it directly. The rendezvous hands
+    // each side the other's observed address and both fire at once, opening a
+    // direct path through their NATs; the Noise handshake then authenticates the
+    // peer over it, exactly as on a direct link. Errors if no peer of this
+    // identity is waiting to be punched, so a caller tries this before falling
+    // back to a relay. A wrong identity is refused at the handshake.
+    pub fn connect_via_punch(
+        rendezvous_addr: SocketAddr,
+        master: [u8; 32],
+    ) -> Result<NetworkTransport> {
+        punch::connect(rendezvous_addr, master)
     }
 
     // Assemble the transport from an established connection and Noise channel.

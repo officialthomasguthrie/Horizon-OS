@@ -64,10 +64,10 @@ enum ConstellationOp {
         /// Do not announce this server to peers on the LAN over mDNS
         #[arg(long)]
         no_announce: bool,
-        /// Also register at this rendezvous (host:port) so peers beyond the LAN can find this server
+        /// Also use this rendezvous (host:port) so peers beyond the LAN can find this server and hole-punch to it
         #[arg(long)]
         rendezvous: Option<String>,
-        /// Also serve through this relay (host:port) so peers can reach this server when no address is dialable
+        /// Also serve through this relay (host:port) so peers can reach this server when no direct path can be opened
         #[arg(long)]
         relay: Option<String>,
     },
@@ -79,10 +79,10 @@ enum ConstellationOp {
         /// Find a peer of this identity on the LAN over mDNS instead of an address
         #[arg(long)]
         discover: bool,
-        /// Find a peer of this identity through a rendezvous (host:port) instead of an address
+        /// Find or hole-punch a peer of this identity through a rendezvous (host:port) instead of an address
         #[arg(long)]
         rendezvous: Option<String>,
-        /// Reach the peer through this relay (host:port) if no direct address works
+        /// Tunnel to the peer through this relay (host:port) if no direct path works
         #[arg(long)]
         relay: Option<String>,
         /// Push local -> peer instead of the default pull
@@ -479,15 +479,18 @@ fn print_report(from: &str, to: &str, r: &SyncReport) {
 
 // Constellation over the network. `serve` opens this store and answers peers
 // that prove the same identity through the Noise handshake, advertises itself on
-// the LAN over mDNS (unless --no-announce), optionally registers at a rendezvous
-// (--rendezvous) so peers beyond the LAN can find it, and optionally binds to a
-// relay (--relay) so peers can reach it even when no address is dialable. `sync`
-// reaches such a peer (given as host:port, found with --discover, looked up with
-// --rendezvous, or tunneled through --relay) and runs the same diff-and-ship the
-// in-process sync runs, only the far transport is a QUIC link. Direction defaults
-// to pull (bring the peer's objects here); --push reverses it and --both
-// converges the two. `rendezvous` and `relay` run those meeting points
-// themselves; both hold no identity.
+// the LAN over mDNS (unless --no-announce), optionally uses a rendezvous
+// (--rendezvous) so peers beyond the LAN can both find it and hole-punch a direct
+// path to it, and optionally binds to a relay (--relay) so peers can reach it even
+// when no direct path can be opened. `sync` reaches such a peer and runs the same
+// diff-and-ship the in-process sync runs, only the far transport is a QUIC link.
+// It escalates in cost order: a given host:port or one found with --discover or
+// --rendezvous is dialed directly; failing that, --rendezvous brokers a hole
+// punch (a direct path that does not relay the data); failing that, --relay
+// tunnels the sync through a third host. Direction defaults to pull (bring the
+// peer's objects here); --push reverses it and --both converges the two.
+// `rendezvous` and `relay` run those meeting points themselves; both hold no
+// identity.
 fn constellation_cmd(op: ConstellationOp) -> Result<()> {
     match op {
         ConstellationOp::Serve {
@@ -522,12 +525,13 @@ fn constellation_cmd(op: ConstellationOp) -> Result<()> {
                     }
                 }
             };
-            // Likewise hold the rendezvous registration: it heartbeats in the
-            // background and withdraws when serve exits.
-            let _registration = match rendezvous {
+            let rz_addr = parse_opt_addr(rendezvous.as_deref(), "--rendezvous")?;
+            // Hold the rendezvous registration: it heartbeats in the background
+            // and withdraws when serve exits. This lists the direct address for
+            // peers to dial.
+            let _registration = match rz_addr {
                 None => None,
-                Some(rzaddr) => {
-                    let rz: SocketAddr = rzaddr.parse().context("parse --rendezvous host:port")?;
+                Some(rz) => {
                     let client = RendezvousClient::connect(rz).context("connect to rendezvous")?;
                     let reg = client
                         .keepalive(constellation::fingerprint(&key), local.port())
@@ -537,6 +541,19 @@ fn constellation_cmd(op: ConstellationOp) -> Result<()> {
                         reg.observed()
                     );
                     Some(reg)
+                }
+            };
+            // Also wait to be hole-punched at the same rendezvous, so a peer that
+            // cannot dial the direct address can still open a direct path before
+            // resorting to a relay. Withdraws when serve exits.
+            let _punch = match rz_addr {
+                None => None,
+                Some(rz) => {
+                    let listener = server
+                        .punch_via_rendezvous(rz)
+                        .context("wait to be punched at rendezvous")?;
+                    eprintln!("waiting to be hole-punched at rendezvous {rz}");
+                    Some(listener)
                 }
             };
             // Likewise hold the relay binding: it keeps a connection to the relay
@@ -564,8 +581,10 @@ fn constellation_cmd(op: ConstellationOp) -> Result<()> {
         } => {
             let key = master_key(&store)?;
             let ls = Lifestream::open(&store, &key).context("open store (wrong passphrase?)")?;
-            let candidates = resolve_peers(peer, discover, rendezvous, &key)?;
-            let (peer, remote) = connect_peer(candidates, relay, key)?;
+            let rz_addr = parse_opt_addr(rendezvous.as_deref(), "--rendezvous")?;
+            let rl_addr = parse_opt_addr(relay.as_deref(), "--relay")?;
+            let candidates = resolve_peers(peer, discover, rz_addr, &key)?;
+            let (peer, remote) = connect_peer(candidates, rz_addr, rl_addr, key)?;
             let local = LocalTransport::new(ls);
             let here = store.display().to_string();
             if both {
@@ -612,7 +631,7 @@ fn constellation_cmd(op: ConstellationOp) -> Result<()> {
 fn resolve_peers(
     peer: Option<String>,
     discover: bool,
-    rendezvous: Option<String>,
+    rendezvous: Option<SocketAddr>,
     key: &[u8; 32],
 ) -> Result<Vec<SocketAddr>> {
     if let Some(p) = peer {
@@ -621,8 +640,7 @@ fn resolve_peers(
 
     let mut candidates: Vec<SocketAddr> = Vec::new();
 
-    if let Some(rzaddr) = rendezvous {
-        let rz: SocketAddr = rzaddr.parse().context("parse --rendezvous host:port")?;
+    if let Some(rz) = rendezvous {
         eprintln!("asking rendezvous {rz} for a peer of this identity...");
         let client = RendezvousClient::connect(rz).context("connect to rendezvous")?;
         let found = client.lookup(&constellation::fingerprint(key))?;
@@ -652,14 +670,17 @@ fn resolve_peers(
     Ok(candidates)
 }
 
-// Connect to the peer. Try each direct candidate in turn; a wrong address (a
-// stale or poisoned rendezvous entry, a peer of another identity) fails the Noise
-// handshake here and we move on. Then, if a relay was given, fall back to
-// tunneling through it, the path that works when no address is dialable at all.
-// Returns a label for the route taken alongside the transport.
+// Connect to the peer, escalating through the routes in cost order. First try
+// each direct candidate; a wrong address (a stale or poisoned rendezvous entry, a
+// peer of another identity) fails the Noise handshake here and we move on. If
+// none works and a rendezvous was given, try a hole punch it brokers: a direct
+// path that, unlike the relay, never carries the sync through a third host. Only
+// if that fails too do we fall back to the relay, the path that works even when
+// no direct path can be opened at all. Returns a label for the route taken.
 fn connect_peer(
     addrs: Vec<SocketAddr>,
-    relay: Option<String>,
+    rendezvous: Option<SocketAddr>,
+    relay: Option<SocketAddr>,
     key: [u8; 32],
 ) -> Result<(String, NetworkTransport)> {
     let mut last: Option<String> = None;
@@ -673,26 +694,43 @@ fn connect_peer(
         }
     }
 
-    if let Some(rladdr) = relay {
-        let rl: SocketAddr = rladdr.parse().context("parse --relay host:port")?;
-        if addrs.is_empty() {
-            eprintln!("reaching the peer through relay {rl}...");
-        } else {
-            eprintln!("no direct route worked; tunneling through relay {rl}...");
+    if let Some(rz) = rendezvous {
+        eprintln!("no direct route; trying a hole punch brokered by rendezvous {rz}...");
+        match NetworkTransport::connect_via_punch(rz, key) {
+            Ok(t) => return Ok((format!("punch via {rz}"), t)),
+            Err(e) => {
+                eprintln!("hole punch did not open a path: {e}");
+                last = Some(e.to_string());
+            }
         }
+    }
+
+    if let Some(rl) = relay {
+        eprintln!("tunneling through relay {rl}...");
         let t = NetworkTransport::connect_via_relay(rl, key).context("connect through relay")?;
         return Ok((format!("relay {rl}"), t));
     }
 
     Err(match last {
         Some(e) => anyhow!(
-            "no candidate peer accepted the connection (same identity/passphrase?); \
+            "no direct route worked and no relay given (same identity/passphrase?); \
              pass --relay to tunnel through a relay. last error: {e}"
         ),
         None => {
             anyhow!("give a peer address, or pass --discover, --rendezvous, or --relay to find one")
         }
     })
+}
+
+// Parse an optional host:port flag, naming the flag in the error.
+fn parse_opt_addr(s: Option<&str>, flag: &str) -> Result<Option<SocketAddr>> {
+    match s {
+        None => Ok(None),
+        Some(s) => Ok(Some(
+            s.parse()
+                .with_context(|| format!("parse {flag} host:port"))?,
+        )),
+    }
 }
 
 // Reconstitution. split turns the store's master key into recovery shares you

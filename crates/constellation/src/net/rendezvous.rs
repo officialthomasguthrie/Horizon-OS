@@ -25,10 +25,12 @@
 //!
 //! Two things build on this. A relay ([`super::relay`]) carries bytes for peers
 //! that cannot reach each other at all, when no address either side learns is
-//! dialable; it is done. NAT hole punching is not: the rendezvous already records
-//! the public address it observes a peer at, which is the input a punch needs,
-//! but the punch itself wants real hosts behind real NATs to test, so it is left
-//! for that setting.
+//! dialable. NAT hole punching ([`super::punch`]) is the optimisation tried
+//! before the relay: the rendezvous already observes each peer's public address,
+//! and it can broker a punch by handing each peer the other's observed address
+//! and a go signal so both fire toward each other at once (see [`punch_wait`] and
+//! [`punch_connect`]). The coordination runs here and over loopback in CI; the
+//! punch only traverses a real NAT on real hosts, which is left for that setting.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -55,9 +57,25 @@ const MAX_MSG: usize = 64 * 1024;
 // The fingerprint -> live addresses map. Each address carries the instant its
 // lease expires; lookups drop the expired ones, so the map self-cleans as it is
 // used and a peer that vanished without unregistering ages out on its own.
+//
+// Alongside it, `pending` holds the peers waiting to be hole-punched: a serving
+// peer that has sent a PunchWait keeps a live connection here (like a relay
+// binding, not a lease), so when a dialer asks to punch its fingerprint the
+// rendezvous can open a stream back to it and push the dialer's observed address.
 #[derive(Default)]
 struct Registry {
     by_fp: HashMap<String, HashMap<SocketAddr, Instant>>,
+    pending: HashMap<String, Vec<PunchWaiter>>,
+}
+
+// One serving peer waiting to be punched: the address the rendezvous observed it
+// at (what the dialer will fire toward) and its live connection (how the
+// rendezvous reaches back to deliver the dialer's address). Keyed by the
+// connection's stable id so it can be withdrawn precisely when it closes.
+struct PunchWaiter {
+    id: usize,
+    observed: SocketAddr,
+    conn: quinn::Connection,
 }
 
 impl Registry {
@@ -91,6 +109,39 @@ impl Registry {
         }
         out.sort();
         out
+    }
+
+    // Record that the peer on `conn`, observed at `observed`, is waiting to be
+    // punched under `fp`. A reconnect under the same id replaces the old entry
+    // rather than doubling it.
+    fn punch_wait(&mut self, fp: String, id: usize, observed: SocketAddr, conn: quinn::Connection) {
+        let bucket = self.pending.entry(fp).or_default();
+        bucket.retain(|w| w.id != id);
+        bucket.push(PunchWaiter { id, observed, conn });
+    }
+
+    fn punch_drop(&mut self, fp: &str, id: usize) {
+        if let Some(bucket) = self.pending.get_mut(fp) {
+            bucket.retain(|w| w.id != id);
+            if bucket.is_empty() {
+                self.pending.remove(fp);
+            }
+        }
+    }
+
+    // The peers waiting to be punched for `fp`, as (id, observed, connection)
+    // tuples to try in turn. Empty if none of that identity is waiting. The
+    // connections are clonable handles; a dead one is dropped by the caller via
+    // [`Registry::punch_drop`] when reaching back over it fails.
+    fn punch_waiters(&self, fp: &str) -> Vec<(usize, SocketAddr, quinn::Connection)> {
+        self.pending
+            .get(fp)
+            .map(|v| {
+                v.iter()
+                    .map(|w| (w.id, w.observed, w.conn.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -161,8 +212,9 @@ async fn accept_loop(endpoint: quinn::Endpoint, registry: Arc<Mutex<Registry>>) 
                 // One request per stream; a peer reuses the connection for many.
                 while let Ok((send, recv)) = conn.accept_bi().await {
                     let registry = registry.clone();
+                    let conn = conn.clone();
                     tokio::spawn(async move {
-                        let _ = serve_stream(registry, observed, send, recv).await;
+                        let _ = serve_stream(registry, conn, observed, send, recv).await;
                     });
                 }
             }
@@ -170,39 +222,125 @@ async fn accept_loop(endpoint: quinn::Endpoint, registry: Arc<Mutex<Registry>>) 
     }
 }
 
+// One request on one stream. A register/lookup/unregister is answered straight
+// from the registry and the stream closes. A PunchWait or PunchConnect is the
+// punch broker, which needs the live connection (to hold it, or to reach back to
+// a waiting peer), so those are handled in their own async paths below.
+//
+// A peer registers an address for its own observed IP and a port it names: it
+// cannot register for someone else's IP (that comes from the packet, not the
+// peer), only for a fingerprint it claims, which is public anyway. The dialable
+// address pairs the observed IP with the peer's announced listen port; the
+// response echoes the full observed address so the peer learns its own mapping.
 async fn serve_stream(
     registry: Arc<Mutex<Registry>>,
+    conn: quinn::Connection,
     observed: SocketAddr,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) -> Result<()> {
     let buf = recv.read_to_end(MAX_MSG).await.map_err(net)?;
-    let resp = apply(&registry, observed, Req::decode(&buf)?)?;
-    send.write_all(&resp.encode()).await.map_err(net)?;
+    match Req::decode(&buf)? {
+        Req::PunchWait { fp } => punch_wait(registry, conn, observed, fp, send).await,
+        Req::PunchConnect { fp } => punch_connect(registry, observed, fp, send).await,
+        req => {
+            let resp = {
+                let now = Instant::now();
+                let mut reg = registry.lock().map_err(|_| net("registry poisoned"))?;
+                match req {
+                    Req::Register { fp, port } => {
+                        reg.register(fp, SocketAddr::new(observed.ip(), port), now);
+                        Resp::Registered(observed)
+                    }
+                    Req::Unregister { fp, port } => {
+                        reg.unregister(&fp, &SocketAddr::new(observed.ip(), port));
+                        Resp::Ok
+                    }
+                    Req::Lookup { fp } => Resp::Addrs(reg.lookup(&fp, now)),
+                    // The punch variants are handled above, before this lock.
+                    _ => unreachable!(),
+                }
+            };
+            send.write_all(&resp.encode()).await.map_err(net)?;
+            send.finish().map_err(net)?;
+            Ok(())
+        }
+    }
+}
+
+// A serving peer waiting to be hole-punched. Record its live connection and
+// observed address under its fingerprint, acknowledge, then hold the connection
+// until it closes (keep-alive keeps it open meanwhile). When it closes, the
+// waiter is withdrawn, so a dialer that arrives later finds no one to punch.
+async fn punch_wait(
+    registry: Arc<Mutex<Registry>>,
+    conn: quinn::Connection,
+    observed: SocketAddr,
+    fp: String,
+    mut send: quinn::SendStream,
+) -> Result<()> {
+    let id = conn.stable_id();
+    registry
+        .lock()
+        .map_err(|_| net("registry poisoned"))?
+        .punch_wait(fp.clone(), id, observed, conn.clone());
+    send.write_all(&Resp::PunchWaiting.encode())
+        .await
+        .map_err(net)?;
     send.finish().map_err(net)?;
+    let _ = conn.closed().await;
+    registry
+        .lock()
+        .map_err(|_| net("registry poisoned"))?
+        .punch_drop(&fp, id);
     Ok(())
 }
 
-// Run one request against the registry. A peer registers an address for its own
-// observed IP and a port it names: it cannot register for someone else's IP
-// (that comes from the packet, not the peer), only for a fingerprint it claims,
-// which is public anyway. The dialable address pairs the observed IP with the
-// peer's announced listen port; the response echoes the full observed address so
-// the peer learns its own public mapping.
-fn apply(registry: &Mutex<Registry>, observed: SocketAddr, req: Req) -> Result<Resp> {
-    let now = Instant::now();
-    let mut reg = registry.lock().map_err(|_| net("registry poisoned"))?;
-    Ok(match req {
-        Req::Register { fp, port } => {
-            reg.register(fp, SocketAddr::new(observed.ip(), port), now);
-            Resp::Registered(observed)
+// A dialer asking to punch a peer of `fp`. Find a waiting peer, open a stream
+// back to it, and push it the dialer's observed address; then answer the dialer
+// with the peer's observed address. Both now hold the other's address and fire
+// toward it at once. A waiter whose connection has gone is dropped and the next
+// is tried; with none left, the dialer is told there is no peer (it falls back
+// to a relay).
+async fn punch_connect(
+    registry: Arc<Mutex<Registry>>,
+    observed: SocketAddr,
+    fp: String,
+    mut send: quinn::SendStream,
+) -> Result<()> {
+    let waiters = registry
+        .lock()
+        .map_err(|_| net("registry poisoned"))?
+        .punch_waiters(&fp);
+    for (id, peer_observed, conn) in waiters {
+        // Open a fresh stream to the waiting peer and push it the dialer's
+        // address. If its connection is gone, drop it from the map and try next.
+        match conn.open_bi().await {
+            Ok((mut s_send, _s_recv)) => {
+                s_send
+                    .write_all(&Resp::PunchGo(observed).encode())
+                    .await
+                    .map_err(net)?;
+                s_send.finish().map_err(net)?;
+                send.write_all(&Resp::PunchGo(peer_observed).encode())
+                    .await
+                    .map_err(net)?;
+                send.finish().map_err(net)?;
+                return Ok(());
+            }
+            Err(_) => {
+                registry
+                    .lock()
+                    .map_err(|_| net("registry poisoned"))?
+                    .punch_drop(&fp, id);
+            }
         }
-        Req::Unregister { fp, port } => {
-            reg.unregister(&fp, &SocketAddr::new(observed.ip(), port));
-            Resp::Ok
-        }
-        Req::Lookup { fp } => Resp::Addrs(reg.lookup(&fp, now)),
-    })
+    }
+    send.write_all(&Resp::PunchNoPeer.encode())
+        .await
+        .map_err(net)?;
+    send.finish().map_err(net)?;
+    Ok(())
 }
 
 // The peer's view of a rendezvous: dial it once and make register/lookup/
@@ -356,14 +494,21 @@ fn unexpected(r: Resp) -> Error {
 
 // The rendezvous wire: tiny request/response messages, distinct from the sync
 // protocol in [`super::wire`] because a rendezvous speaks no identity and moves
-// no objects. One request, one response, per stream.
-enum Req {
+// no objects. One request, one response, per stream. Shared with [`super::punch`]
+// (pub(super)), which speaks the PunchWait/PunchConnect side of the protocol.
+pub(super) enum Req {
     Register { fp: String, port: u16 },
     Unregister { fp: String, port: u16 },
     Lookup { fp: String },
+    // A serving peer offering itself to be hole-punched under a fingerprint. The
+    // rendezvous holds the connection open and pushes a PunchGo when a dialer
+    // arrives.
+    PunchWait { fp: String },
+    // A dialer asking the rendezvous to broker a punch to a peer of a fingerprint.
+    PunchConnect { fp: String },
 }
 
-enum Resp {
+pub(super) enum Resp {
     // How the rendezvous observed the registrant (public IP and source port).
     Registered(SocketAddr),
     // Acknowledges an unregister.
@@ -371,10 +516,18 @@ enum Resp {
     // The live addresses for a looked-up fingerprint.
     Addrs(Vec<SocketAddr>),
     Err(String),
+    // Acknowledges a PunchWait: the peer is now waiting to be punched.
+    PunchWaiting,
+    // The other peer's observed address: fire a punch toward it now. Sent to the
+    // dialer in reply, and pushed to the waiting peer on a stream the rendezvous
+    // opens back to it.
+    PunchGo(SocketAddr),
+    // No peer of that fingerprint is waiting to be punched.
+    PunchNoPeer,
 }
 
 impl Req {
-    fn encode(&self) -> Vec<u8> {
+    pub(super) fn encode(&self) -> Vec<u8> {
         let mut o = Vec::new();
         match self {
             Req::Register { fp, port } => {
@@ -391,11 +544,19 @@ impl Req {
                 o.push(3);
                 put_str(&mut o, fp);
             }
+            Req::PunchWait { fp } => {
+                o.push(4);
+                put_str(&mut o, fp);
+            }
+            Req::PunchConnect { fp } => {
+                o.push(5);
+                put_str(&mut o, fp);
+            }
         }
         o
     }
 
-    fn decode(buf: &[u8]) -> Result<Req> {
+    pub(super) fn decode(buf: &[u8]) -> Result<Req> {
         let mut r = Reader::new(buf);
         Ok(match r.u8()? {
             1 => Req::Register {
@@ -407,13 +568,15 @@ impl Req {
                 port: r.u16()?,
             },
             3 => Req::Lookup { fp: r.string()? },
+            4 => Req::PunchWait { fp: r.string()? },
+            5 => Req::PunchConnect { fp: r.string()? },
             t => return Err(net(format!("bad rendezvous request tag {t}"))),
         })
     }
 }
 
 impl Resp {
-    fn encode(&self) -> Vec<u8> {
+    pub(super) fn encode(&self) -> Vec<u8> {
         let mut o = Vec::new();
         match self {
             Resp::Registered(addr) => {
@@ -432,11 +595,17 @@ impl Resp {
                 o.push(4);
                 put_str(&mut o, s);
             }
+            Resp::PunchWaiting => o.push(5),
+            Resp::PunchGo(addr) => {
+                o.push(6);
+                put_addr(&mut o, addr);
+            }
+            Resp::PunchNoPeer => o.push(7),
         }
         o
     }
 
-    fn decode(buf: &[u8]) -> Result<Resp> {
+    pub(super) fn decode(buf: &[u8]) -> Result<Resp> {
         let mut r = Reader::new(buf);
         Ok(match r.u8()? {
             1 => Resp::Registered(get_addr(&mut r)?),
@@ -450,6 +619,9 @@ impl Resp {
                 Resp::Addrs(addrs)
             }
             4 => Resp::Err(r.string()?),
+            5 => Resp::PunchWaiting,
+            6 => Resp::PunchGo(get_addr(&mut r)?),
+            7 => Resp::PunchNoPeer,
             t => return Err(net(format!("bad rendezvous response tag {t}"))),
         })
     }
@@ -592,6 +764,54 @@ mod tests {
 
         let reg = Resp::Registered(v4a);
         assert!(matches!(Resp::decode(&reg.encode()).unwrap(), Resp::Registered(a) if a == v4a));
+    }
+
+    #[test]
+    fn punch_messages_round_trip() {
+        // The broker requests carry only a fingerprint.
+        let wait = Req::PunchWait {
+            fp: "feedface".into(),
+        };
+        assert!(matches!(
+            Req::decode(&wait.encode()).unwrap(),
+            Req::PunchWait { fp } if fp == "feedface"
+        ));
+        let conn = Req::PunchConnect {
+            fp: "feedface".into(),
+        };
+        assert!(matches!(
+            Req::decode(&conn.encode()).unwrap(),
+            Req::PunchConnect { fp } if fp == "feedface"
+        ));
+
+        // PunchGo carries the peer's observed address, both families.
+        let v6: SocketAddr = "[2001:db8::5]:9999".parse().unwrap();
+        let v4a = v4(203, 0, 113, 5, 9999);
+        for addr in [v4a, v6] {
+            assert!(matches!(
+                Resp::decode(&Resp::PunchGo(addr).encode()).unwrap(),
+                Resp::PunchGo(a) if a == addr
+            ));
+        }
+        assert!(matches!(
+            Resp::decode(&Resp::PunchWaiting.encode()).unwrap(),
+            Resp::PunchWaiting
+        ));
+        assert!(matches!(
+            Resp::decode(&Resp::PunchNoPeer.encode()).unwrap(),
+            Resp::PunchNoPeer
+        ));
+    }
+
+    // An empty registry has no one waiting to punch and tolerates withdrawing an
+    // unknown waiter. The waiters hold live connections, so matching and pushing
+    // are exercised by the loopback test in tests/punch.rs rather than here.
+    #[test]
+    fn empty_registry_has_no_punch_waiters() {
+        let mut reg = Registry::default();
+        assert!(reg.punch_waiters("alice").is_empty());
+        reg.punch_drop("ghost", 1);
+        assert!(reg.pending.is_empty());
     }
 
     #[test]

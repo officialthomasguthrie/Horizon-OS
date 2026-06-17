@@ -34,6 +34,17 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
 - horizon weave CLI: grant / revoke / use / grants / audit / verify, plus a
   scripted `weave demo` that walks the full grant-use-deny-revoke lifecycle and
   prints the resulting audit log.
+- Phase 5 constellation crate: object sync between two Lifestream stores of one
+  identity. A Transport trait abstracts a peer; sync diffs the two id sets and
+  ships only the sealed records the other side lacks (content addressing makes
+  shared history free), then carries refs forward fast-forward-only, reporting
+  divergence rather than clobbering it. Records cross as ciphertext and the
+  receiver verifies each against its own key before committing, so a wrong
+  identity is refused, not corrupted. LocalTransport is the in-process transport;
+  a QUIC+Noise network skin implements the same trait later. 8 tests passing.
+- horizon sync CLI: `horizon sync <from> <to> [--both]`. Creates the destination
+  as a replica of the source identity when absent, refuses a foreign one, and
+  reports objects moved and refs set / advanced / diverged.
 
 ## Next
 
@@ -44,6 +55,10 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   the shell in Phase 3 (it is an L5 compositor surface); `horizon weave
   audit/grants` is the headless stand-in until then.
 - Phase 3: shell + Wayland compositor (Smithay/iced). Linux-only.
-- Cross-platform option to keep momentum on any host: Phase 5 Constellation
-  object sync (replicate missing Lifestream objects by hash between two stores),
-  which reuses the content-addressed store directly.
+- Phase 5 Constellation network transport: a QUIC + Noise skin implementing the
+  same Transport trait the in-process sync already runs on, with peer discovery
+  and NAT traversal. Network/Linux-host work; the sync core and CLI are done and
+  cross-platform.
+- Phase 5 Reconstitution: Shamir/SLIP-39 k-of-n identity recovery and a second
+  FIDO2 enrollment. The secret-sharing core is cross-platform and a good next
+  cross-platform piece; FIDO2 and boot integration are Linux-only.

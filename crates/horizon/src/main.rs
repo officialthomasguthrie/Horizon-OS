@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use constellation::{LocalTransport, SyncReport};
 use lifestream::{Lifestream, Object, ObjectId};
 use weave::{Broker, Event, GrantId, Limits, Resource, Rights};
 
@@ -25,6 +26,16 @@ enum Cmd {
     Weave {
         #[command(subcommand)]
         op: WeaveOp,
+    },
+    /// Replicate Lifestream objects to another store of the same identity
+    Sync {
+        /// Source store
+        from: PathBuf,
+        /// Destination store (created as a replica if it does not exist)
+        to: PathBuf,
+        /// Also pull the destination back, so both stores end up matching
+        #[arg(long)]
+        both: bool,
     },
 }
 
@@ -106,6 +117,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Lifestream { op } => lifestream_cmd(op),
         Cmd::Weave { op } => weave_cmd(op),
+        Cmd::Sync { from, to, both } => sync_cmd(from, to, both),
     }
 }
 
@@ -315,6 +327,64 @@ fn weave_demo(store: &Path) -> Result<()> {
     println!();
     println!("verify:  {} entries, chain intact", b.verify()?);
     Ok(())
+}
+
+// Constellation sync. Both stores belong to one identity, so they share the
+// master key: the source's key salt is the identity's, and a fresh destination
+// is created from it. Refusing a destination whose salt differs stops you from
+// trying to fold two unrelated identities together (their object ids would not
+// even line up).
+fn sync_cmd(from: PathBuf, to: PathBuf, both: bool) -> Result<()> {
+    let pass = passphrase()?;
+    let from_salt =
+        std::fs::read(from.join("keysalt")).context("read source keysalt (is this a store?)")?;
+    let key = derive(&pass, &from_salt);
+    let src = Lifestream::open(&from, &key)?;
+
+    let dst = if to.join("keysalt").exists() {
+        let to_salt = std::fs::read(to.join("keysalt")).context("read destination keysalt")?;
+        if to_salt != from_salt {
+            return Err(anyhow!(
+                "destination is a different identity (key salt differs); \
+                 the Constellation syncs replicas of one identity"
+            ));
+        }
+        Lifestream::open(&to, &key)?
+    } else {
+        let d = Lifestream::init(&to, &key)?;
+        std::fs::write(to.join("keysalt"), &from_salt).context("write destination keysalt")?;
+        println!("created replica at {}", to.display());
+        d
+    };
+
+    let a = LocalTransport::new(src);
+    let b = LocalTransport::new(dst);
+
+    print_sync(&from, &to, &constellation::sync(&a, &b)?);
+    if both {
+        print_sync(&to, &from, &constellation::sync(&b, &a)?);
+    }
+    Ok(())
+}
+
+fn print_sync(from: &Path, to: &Path, r: &SyncReport) {
+    println!(
+        "{} -> {}: {} objects, {} new ({} bytes)",
+        from.display(),
+        to.display(),
+        r.source_objects,
+        r.transferred,
+        r.bytes
+    );
+    for name in &r.refs_set {
+        println!("  ref {name} set");
+    }
+    for name in &r.refs_advanced {
+        println!("  ref {name} advanced");
+    }
+    for name in &r.refs_conflicted {
+        println!("  ref {name} diverged, left unchanged");
+    }
 }
 
 fn print_audit(b: &Broker) -> Result<()> {

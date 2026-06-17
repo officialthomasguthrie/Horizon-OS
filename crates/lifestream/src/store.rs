@@ -94,6 +94,40 @@ impl ObjectStore {
         }
     }
 
+    // The sealed record for an id, exactly as it sits on disk (nonce ||
+    // ciphertext). This is what crosses the wire during sync: a peer relays
+    // ciphertext and never sees plaintext.
+    pub fn read_record(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        match fs::read(self.path_for(id)) {
+            Ok(r) => Ok(r),
+            Err(e) if e.kind() == ErrorKind::NotFound => Err(Error::NotFound(id.to_hex())),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    // Accept a sealed record from a peer. We hold the same key, so before
+    // trusting it we open it (which checks the AEAD tag and binds the id as AAD)
+    // and confirm the plaintext addresses back to id. A record we cannot open or
+    // that lies about its id is refused, not written. Returns false if the
+    // object was already present.
+    pub fn write_record(&self, id: &ObjectId, record: &[u8]) -> Result<bool> {
+        let path = self.path_for(id);
+        if path.exists() {
+            return Ok(false); // already stored, dedup
+        }
+        let plaintext = self.keys.open(id, record)?;
+        if self.keys.id_of(&plaintext) != *id {
+            return Err(Error::Corrupt(format!("hash mismatch for {id}")));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, record)?;
+        fs::rename(&tmp, &path)?;
+        Ok(true)
+    }
+
     pub fn list_ids(&self) -> Result<Vec<ObjectId>> {
         let mut out = Vec::new();
         for shard in fs::read_dir(self.root.join("objects"))? {

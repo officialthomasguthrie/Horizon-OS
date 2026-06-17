@@ -60,6 +60,23 @@ impl Lifestream {
         Ok(self.store.list_ids()?.len())
     }
 
+    // Every object id in the store. Sync diffs two of these to find what is
+    // missing on the other side.
+    pub fn list_ids(&self) -> Result<Vec<ObjectId>> {
+        self.store.list_ids()
+    }
+
+    // Raw sealed-record access, the byte level sync moves objects at. read_record
+    // hands out ciphertext as stored; write_record verifies an incoming record
+    // with our key before committing it. See ObjectStore for the checks.
+    pub fn read_record(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        self.store.read_record(id)
+    }
+
+    pub fn write_record(&self, id: &ObjectId, record: &[u8]) -> Result<bool> {
+        self.store.write_record(id, record)
+    }
+
     // Store raw bytes as a chunked File object and return its id.
     pub fn write_bytes(&self, data: &[u8]) -> Result<ObjectId> {
         let mut chunks = Vec::new();

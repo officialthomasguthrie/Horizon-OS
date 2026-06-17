@@ -54,6 +54,29 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
 - horizon reconstitute CLI: `split <store> --k --n` cuts recovery shares from a
   store's master key; `open <store> --share ...` rebuilds the key from k shares
   and opens the store with no passphrase, decrypting HEAD to prove the key.
+- Phase 5 constellation network transport (`net` feature, on by default): the
+  QUIC + Noise skin behind the same Transport trait the in-process sync already
+  runs on, so the sync algorithm in `sync()` does not change. quinn carries the
+  bytes; a Noise NNpsk0 handshake, keyed by a PSK derived from the identity
+  master, authenticates the peer and lays a second AEAD over a small request /
+  response protocol (have, read_record, write_record, refs, get_ref, set_ref,
+  parents). A wrong identity is refused at the handshake, before any object
+  moves. QUIC's own TLS here is only the transport envelope (a throwaway
+  self-signed cert, accept-any on the client); identity lives in the Noise layer
+  alone, so terminating the TLS buys an attacker nothing. A record can be a
+  64 KiB chunk plus sealing overhead, larger than one Noise message, so frames
+  are length-prefixed and split into segments under the 65535-byte cap and
+  reassembled on the far side. The trait stays blocking: the network side keeps
+  its own tokio runtime and bridges each call with block_on, so neither the sync
+  core nor the Lifestream (blocking file IO) is coloured async. Server serves one
+  identity's store to peers; NetworkTransport is the dialing peer and also a
+  Transport, so a network sync is `sync(remote, local)` or `sync(local, remote)`.
+  4 loopback tests: push and pull with multi-segment records, cross-wire dedup
+  and HEAD fast-forward, and wrong-identity refusal. Slim builds turn `net` off.
+- horizon constellation CLI: `serve <store> [--listen host:port]` answers peers
+  of the same identity until stopped; `sync <store> <peer> [--push] [--both]`
+  dials a serving peer and runs the sync, default pull, --push to send, --both to
+  converge the two stores.
 
 ## Next
 
@@ -64,10 +87,12 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   the shell in Phase 3 (it is an L5 compositor surface); `horizon weave
   audit/grants` is the headless stand-in until then.
 - Phase 3: shell + Wayland compositor (Smithay/iced). Linux-only.
-- Phase 5 Constellation network transport: a QUIC + Noise skin implementing the
-  same Transport trait the in-process sync already runs on, with peer discovery
-  and NAT traversal. Network/Linux-host work; the sync core and CLI are done and
-  cross-platform.
+- Phase 5 Constellation discovery and NAT traversal: the QUIC + Noise transport
+  and its serve/sync CLI are done and loopback-tested on darwin. What remains is
+  finding peers without a hardcoded host:port (mDNS on a LAN, a rendezvous or
+  relay for the open internet) and hole punching through NAT, plus serving more
+  than one peer at a time safely (the store's temp-file writes assume a single
+  writer). Real-host and network work.
 - Phase 5 Reconstitution boot/identity wiring: bind recovery shares to FIDO2
   re-enrollment and the boot-time unlock path, and a phone as a post-boot trusted
   device. Linux-only; the secret-sharing core and CLI are done and cross-platform.

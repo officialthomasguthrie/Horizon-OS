@@ -1,10 +1,11 @@
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use constellation::{LocalTransport, SyncReport};
+use constellation::{LocalTransport, NetworkTransport, Server, SyncReport};
 use lifestream::{Lifestream, Object, ObjectId};
 use reconstitution::Share;
 use weave::{Broker, Event, GrantId, Limits, Resource, Rights};
@@ -42,6 +43,34 @@ enum Cmd {
     Reconstitute {
         #[command(subcommand)]
         op: ReconOp,
+    },
+    /// Replicate over the network to another device of the same identity
+    Constellation {
+        #[command(subcommand)]
+        op: ConstellationOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConstellationOp {
+    /// Serve this store to other devices over QUIC + Noise until stopped
+    Serve {
+        store: PathBuf,
+        /// Address to listen on (host:port)
+        #[arg(long, default_value = "0.0.0.0:7777")]
+        listen: String,
+    },
+    /// Sync with a peer that is serving the same identity
+    Sync {
+        store: PathBuf,
+        /// Peer address (host:port)
+        peer: String,
+        /// Push local -> peer instead of the default pull
+        #[arg(long)]
+        push: bool,
+        /// Sync both directions so the two stores converge
+        #[arg(long)]
+        both: bool,
     },
 }
 
@@ -144,6 +173,7 @@ fn main() -> Result<()> {
         Cmd::Weave { op } => weave_cmd(op),
         Cmd::Sync { from, to, both } => sync_cmd(from, to, both),
         Cmd::Reconstitute { op } => recon_cmd(op),
+        Cmd::Constellation { op } => constellation_cmd(op),
     }
 }
 
@@ -394,13 +424,13 @@ fn sync_cmd(from: PathBuf, to: PathBuf, both: bool) -> Result<()> {
 }
 
 fn print_sync(from: &Path, to: &Path, r: &SyncReport) {
+    print_report(&from.display().to_string(), &to.display().to_string(), r);
+}
+
+fn print_report(from: &str, to: &str, r: &SyncReport) {
     println!(
         "{} -> {}: {} objects, {} new ({} bytes)",
-        from.display(),
-        to.display(),
-        r.source_objects,
-        r.transferred,
-        r.bytes
+        from, to, r.source_objects, r.transferred, r.bytes
     );
     for name in &r.refs_set {
         println!("  ref {name} set");
@@ -411,6 +441,49 @@ fn print_sync(from: &Path, to: &Path, r: &SyncReport) {
     for name in &r.refs_conflicted {
         println!("  ref {name} diverged, left unchanged");
     }
+}
+
+// Constellation over the network. `serve` opens this store and answers peers
+// that prove the same identity through the Noise handshake; `sync` dials such a
+// peer and runs the same diff-and-ship the in-process sync runs, only the far
+// transport is a QUIC link. Direction defaults to pull (bring the peer's
+// objects here); --push reverses it and --both converges the two.
+fn constellation_cmd(op: ConstellationOp) -> Result<()> {
+    match op {
+        ConstellationOp::Serve { store, listen } => {
+            let key = master_key(&store)?;
+            let ls = Lifestream::open(&store, &key).context("open store (wrong passphrase?)")?;
+            let addr: SocketAddr = listen.parse().context("parse --listen host:port")?;
+            let server = Server::start(addr, key, ls)?;
+            println!("serving {} on {}", store.display(), server.local_addr());
+            eprintln!("peers must prove the same identity; ctrl-c to stop");
+            server.wait();
+        }
+        ConstellationOp::Sync {
+            store,
+            peer,
+            push,
+            both,
+        } => {
+            let key = master_key(&store)?;
+            let ls = Lifestream::open(&store, &key).context("open store (wrong passphrase?)")?;
+            let addr: SocketAddr = peer.parse().context("parse peer host:port")?;
+            let remote = NetworkTransport::connect(addr, key)
+                .context("connect to peer (same identity/passphrase?)")?;
+            let local = LocalTransport::new(ls);
+            let here = store.display().to_string();
+            if both {
+                print_report(&peer, &here, &constellation::sync(&remote, &local)?);
+                print_report(&here, &peer, &constellation::sync(&local, &remote)?);
+            } else if push {
+                print_report(&here, &peer, &constellation::sync(&local, &remote)?);
+            } else {
+                print_report(&peer, &here, &constellation::sync(&remote, &local)?);
+            }
+            remote.close().ok();
+        }
+    }
+    Ok(())
 }
 
 // Reconstitution. split turns the store's master key into recovery shares you
@@ -543,9 +616,15 @@ fn now_unix() -> u64 {
 }
 
 fn open(store: &Path) -> Result<Lifestream> {
+    Ok(Lifestream::open(store, &master_key(store)?)?)
+}
+
+// The store's master key from the passphrase and its salt. Constellation needs
+// the key itself, not just an open store, to bind the Noise handshake to the
+// identity.
+fn master_key(store: &Path) -> Result<[u8; 32]> {
     let salt = std::fs::read(store.join("keysalt")).context("read keysalt (is this a store?)")?;
-    let key = derive(&passphrase()?, &salt);
-    Ok(Lifestream::open(store, &key)?)
+    Ok(derive(&passphrase()?, &salt))
 }
 
 fn resolve(ls: &Lifestream, name: &str) -> Result<ObjectId> {

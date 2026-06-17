@@ -12,15 +12,21 @@
 //! does hold the key, verifies each record before it commits it (see
 //! [`lifestream::Lifestream::write_record`]).
 //!
-//! This is the in-process core. The network skin (QUIC + Noise, NAT traversal)
-//! is a later phase and is Linux-host work; it implements the same [`Transport`]
-//! trait, so the algorithm here does not change.
+//! This is the in-process core. The network skin lives in [`net`] (enabled by
+//! the default `net` feature): a QUIC + Noise link that implements the same
+//! [`Transport`] trait, so the algorithm here does not change.
 
 mod error;
 mod transport;
 
+#[cfg(feature = "net")]
+pub mod net;
+
 pub use error::{Error, Result};
 pub use transport::{LocalTransport, Transport};
+
+#[cfg(feature = "net")]
+pub use net::{NetworkTransport, Server};
 
 use std::collections::HashSet;
 

@@ -400,6 +400,30 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   metal next. `horizon compositor drm` (behind the CLI's `compositor-udev` feature)
   runs it from a console. Built and compile-checked from the Linux container on
   this display-less darwin host.
+- Phase 3 compositor DRM hardening (`compositor` `udev` feature, Linux): the
+  bare-metal backend, first written single-GPU/single-output/no-hotplug, is now
+  multi-GPU and hotplug-aware and recovers across a VT switch. Reactivating after a
+  VT switch re-acquires DRM master and reset_state()s every device and surface
+  (activate(true)), then drops the now-stale swapchains (reset_buffers) so the next
+  frame reallocates and reprograms the mode; the frame in flight when the session
+  paused never gets its vblank, so its pending flag is cleared and a fresh full
+  frame is drawn. The one-shot single-device scan became a udev-driven model: a
+  UdevBackend enumerates the GPUs at startup and watches for changes, so every GPU
+  udev reports is brought up (multi-GPU), a GPU hotplugged in or out is added or
+  dropped, and each device rescans its connectors on a udev change, so plugging or
+  unplugging a monitor lights or drops its output. Each GPU keeps its own DRM
+  output manager, its render node in the one shared multi-GPU manager, and its own
+  vblank source; every connected connector takes a free CRTC at its preferred mode,
+  several outputs per device are supported, and the present loop renders each
+  output that is not waiting on a page flip, retiring it on its own vblank. Because
+  clients here attach shm (CPU) buffers, a window composites on whichever GPU
+  drives the output with no cross-GPU buffer sharing, which is what keeps multi-GPU
+  simple. Still on the same split: compile-checked and clippy-clean under the udev
+  feature in CI, eye-verified on hardware next. Left for later: a display-only
+  secondary GPU (render on one card, scan out on another, the one cross-GPU case
+  shm sidesteps) and a real multi-monitor logical layout (outputs mirror the single
+  scene for now). Built and compile-checked from the Linux container on this
+  display-less darwin host.
 
 ## Next
 
@@ -418,11 +442,14 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   container). The next step is the eye part: run `horizon compositor show` on a
   real Linux session to watch a client's window appear in the nested window and
   click and type into it, and run `horizon compositor drm` from a console on bare
-  metal to do the same straight on the GPU. After that, multi-GPU / connector
-  hotplug / VT-switch buffer recovery on the DRM path, and then the shell proper,
-  iced + wgpu with the Aura intent line as launcher and command palette, and Glass
-  as an L5 compositor surface over the weave audit log. Confined cells can already
-  host compositor surfaces (the cells exec path is ready). Linux-only.
+  metal to do the same straight on the GPU. The DRM path has since been hardened
+  (multi-GPU, connector and GPU hotplug, VT-switch buffer recovery), all written
+  and compile-checked on the same split, so it too is waiting on that eye part;
+  what is left on it is a display-only secondary GPU and a real multi-monitor
+  logical layout. Then the shell proper, iced + wgpu with the Aura intent line as
+  launcher and command palette, and Glass as an L5 compositor surface over the
+  weave audit log. Confined cells can already host compositor surfaces (the cells
+  exec path is ready). Linux-only.
 - Glass: the live transparency surface over the weave audit log. It lands as a
   compositor surface now there is a renderer to draw it on (the `render`/`winit`
   features above); `horizon weave audit/grants` is the headless stand-in until the

@@ -275,13 +275,55 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   and an unprivileged user: the cell root holds only the bound system dirs, /proc,
   and /dev (no /work, /root, or /home), the network namespace is empty, the
   unprivileged caller is mapped to root inside, and a nonzero exit comes back.
+- Phase 3 compositor headless core (`compositor` crate, Linux): the start of the
+  experience layer (L5), a real Wayland server built on Smithay that real clients
+  connect to, holding the protocol and scene logic a display backend later sits
+  on. It advertises the core globals every app needs, wl_compositor,
+  wl_subcompositor, wl_shm, xdg_shell, wl_seat (keyboard + pointer), and wl_output
+  (with xdg-output), over a Unix socket under $XDG_RUNTIME_DIR, and tracks every
+  xdg toplevel in a Smithay desktop Space: new_toplevel maps a window and the
+  client's initial commit is the cue to send the xdg configure, toplevel_destroyed
+  (with a Space refresh as the backstop for a client that vanished) unmaps it. It
+  does not paint yet, deliberately. The protocol and the scene are the part that
+  can be proven without a display or a GPU, so they are built and CI-tested
+  headlessly here, while the on-screen backend (a winit window nested in an
+  existing session, then a real DRM/KMS backend) needs real hardware and is
+  verified by eye next, the same split the Constellation used: its whole
+  networking core is tested on one host and only NAT traversal waits for real
+  machines. Only Smithay's wayland_frontend + desktop features are pulled, so the
+  Wayland stack is pure Rust plus one system library, libxkbcommon, which the seat
+  keyboard needs to compile an xkb keymap; the renderer and the display backends
+  stay out. Linux-gated like cells, so the workspace still builds on darwin (where
+  available() is false and there is no Compositor). Tests prove it end to end with
+  a real in-process Wayland client and no display: the server advertises the core
+  globals, and a client that opens a titled xdg toplevel sees it mapped into the
+  scene and then dropped on destroy. Green as root and as the unprivileged dev user.
+- horizon compositor run (`horizon compositor run`): start the headless compositor
+  and watch it manage clients at the command line, the way `weave demo` and `cell
+  demo` make their subsystems visible. It prints the WAYLAND_DISPLAY to point
+  clients at (falling back to a private runtime dir when a bare shell has none),
+  then logs each window as it maps and unmaps. Without a renderer it shows no
+  pixels, but the scene graph is real, so connecting any Wayland client and
+  watching its window appear and leave the log exercises the whole server. Linux-
+  gated like the cell commands; other hosts say the compositor is unavailable.
+  Verified end to end through the binary: a real client opened a titled toplevel
+  and the compositor logged it mapping and then unmapping.
 
 ## Next
 
-- Glass: the live transparency surface over the weave audit log. It lands with
-  the shell in Phase 3 (it is an L5 compositor surface); `horizon weave
-  audit/grants` is the headless stand-in until then.
-- Phase 3: shell + Wayland compositor (Smithay/iced). Linux-only.
+- Phase 3: the experience layer. The compositor's headless core is done and
+  CI-tested (a real Wayland server: the core globals, the xdg-shell toplevel
+  lifecycle, the scene graph). The next step is making windows visible: a Smithay
+  winit backend running nested inside an existing Wayland/X session first, then a
+  real DRM/KMS backend, with a wgpu/GL renderer that imports client buffers and
+  composites the Space (this is the part that needs a display and a GPU, verified
+  by eye). After that, the shell proper, iced + wgpu with the Aura intent line as
+  launcher and command palette, and Glass as an L5 compositor surface over the
+  weave audit log. Confined cells can already host compositor surfaces (the cells
+  exec path is ready). Linux-only.
+- Glass: the live transparency surface over the weave audit log. It lands as a
+  compositor surface once there is a renderer to draw it on (see Phase 3 above);
+  `horizon weave audit/grants` is the headless stand-in until then.
 - Phase 5 Constellation real-host verification: the whole networking stack that
   can be built and tested on one host is done and in CI, the QUIC + Noise
   transport, serve/sync CLI, concurrent multi-peer serving, mDNS LAN discovery,

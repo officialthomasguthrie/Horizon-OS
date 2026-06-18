@@ -56,6 +56,11 @@ enum Cmd {
         #[command(subcommand)]
         op: CellOp,
     },
+    /// Run the Wayland compositor (the experience layer)
+    Compositor {
+        #[command(subcommand)]
+        op: CompositorOp,
+    },
 }
 
 #[derive(Subcommand)]
@@ -129,6 +134,12 @@ enum CellOp {
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum CompositorOp {
+    /// Start the headless Wayland server and log windows as they map and unmap
+    Run,
 }
 
 #[derive(Subcommand)]
@@ -232,6 +243,7 @@ fn main() -> Result<()> {
         Cmd::Reconstitute { op } => recon_cmd(op),
         Cmd::Constellation { op } => constellation_cmd(op),
         Cmd::Cell { op } => cell_cmd(op),
+        Cmd::Compositor { op } => compositor_cmd(op),
     }
 }
 
@@ -665,6 +677,73 @@ fn split_bind(spec: &str) -> (PathBuf, PathBuf) {
         Some((src, dst)) => (PathBuf::from(src), PathBuf::from(dst)),
         None => (PathBuf::from(spec), PathBuf::from(spec)),
     }
+}
+
+fn compositor_cmd(op: CompositorOp) -> Result<()> {
+    match op {
+        CompositorOp::Run => compositor_run(),
+    }
+}
+
+// Run the compositor's headless core: a real Wayland server clients connect to,
+// with no display backend yet. It cannot paint pixels, but the scene graph is
+// real, so every window a client opens is tracked; we log them as they map and
+// unmap to make that visible at the command line, the way `weave demo` makes the
+// audit log visible. Point a client at the printed WAYLAND_DISPLAY to watch.
+#[cfg(target_os = "linux")]
+fn compositor_run() -> Result<()> {
+    if !compositor::available() {
+        println!("the compositor needs Linux (Wayland); this host has none");
+        return Ok(());
+    }
+
+    // The Wayland socket lives under XDG_RUNTIME_DIR. A real session always sets
+    // it; for a bare dev shell, fall back to a private temp dir so the command
+    // still works. (The library stays strict and binds wherever it points.)
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        let dir = std::env::temp_dir().join(format!("horizon-compositor.{}", std::process::id()));
+        std::fs::create_dir_all(&dir).context("create runtime dir")?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        println!(
+            "compositor: XDG_RUNTIME_DIR was unset; using {}",
+            dir.display()
+        );
+    }
+
+    let mut comp = compositor::Compositor::new().context("start compositor")?;
+    let socket = comp.socket_name().to_string_lossy().into_owned();
+    println!("compositor: headless Wayland server (no display backend yet)");
+    println!("compositor: listening on WAYLAND_DISPLAY={socket}");
+    println!("compositor: connect a client, e.g.  WAYLAND_DISPLAY={socket} <wayland-app>");
+    println!("compositor: windows are logged as they map and unmap; Ctrl-C to stop");
+    println!();
+    io::stdout().flush().ok();
+
+    let mut last = usize::MAX;
+    loop {
+        comp.dispatch(Some(Duration::from_millis(200)))
+            .context("dispatch")?;
+        let count = comp.window_count();
+        if count != last {
+            let titles = comp.window_titles();
+            let labels = if titles.is_empty() {
+                "(untitled or none)".to_string()
+            } else {
+                titles.join(", ")
+            };
+            println!("compositor: {count} window(s) mapped: {labels}");
+            io::stdout().flush().ok();
+            last = count;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn compositor_run() -> Result<()> {
+    println!("the compositor needs Linux (Wayland); this host has none");
+    Ok(())
 }
 
 // Constellation sync. Both stores belong to one identity, so they share the

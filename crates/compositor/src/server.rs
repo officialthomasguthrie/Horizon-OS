@@ -57,6 +57,11 @@ struct State {
     #[allow(dead_code)]
     output: Output,
     space: Space<Window>,
+    // The shell background: the L5 home surface (Horizon draws Glass here) painted
+    // behind every client window. None paints the clear color. Render-gated, since
+    // drawing it needs a renderer.
+    #[cfg(feature = "render")]
+    background: Option<crate::render::ShellBackground>,
     // Where the next toplevel is placed. Without a real layout we just step
     // windows across so several are distinct in the scene.
     next_x: i32,
@@ -400,6 +405,8 @@ impl Compositor {
             outputs,
             output,
             space,
+            #[cfg(feature = "render")]
+            background: None,
             next_x: 0,
             pointer_loc: (0.0, 0.0).into(),
             start: Instant::now(),
@@ -519,7 +526,28 @@ impl Compositor {
     /// (pixman) renderer, no display or GPU, so a test can assert on the result.
     #[cfg(feature = "render")]
     pub fn render(&mut self) -> Result<crate::render::RenderedFrame> {
-        crate::render::render_space(&self.state.space, &self.state.output)
+        crate::render::render_space(
+            &self.state.space,
+            &self.state.output,
+            self.state.background.as_ref(),
+        )
+    }
+
+    /// Set the shell background: the full-screen image drawn behind every client
+    /// window. `rgba` is `width * height` pixels, four bytes each in R, G, B, A
+    /// order (what `glass::Pixmap` produces); an empty slice or a non-positive
+    /// size clears it. Horizon renders the Glass surface and sets it here.
+    #[cfg(feature = "render")]
+    pub fn set_shell_background(&mut self, rgba: &[u8], width: i32, height: i32) {
+        let ok = width > 0 && height > 0 && rgba.len() >= (width as usize * height as usize * 4);
+        self.state.background =
+            ok.then(|| crate::render::ShellBackground::new(rgba.to_vec(), width, height));
+    }
+
+    // The shell background the winit backend paints behind the scene, if set.
+    #[cfg(feature = "winit")]
+    pub(crate) fn background(&self) -> Option<&crate::render::ShellBackground> {
+        self.state.background.as_ref()
     }
 
     /// The output's pixel size (width, height). The offscreen framebuffer and the

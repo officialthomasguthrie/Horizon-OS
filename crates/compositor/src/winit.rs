@@ -81,6 +81,7 @@ pub(crate) fn run(comp: &mut Compositor) -> Result<()> {
                 size,
                 Transform::Flipped180,
                 clear,
+                comp.background(),
             )?;
         }
         backend

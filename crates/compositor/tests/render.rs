@@ -153,6 +153,44 @@ fn composites_client_buffer_into_pixels() {
     client.join().unwrap();
 }
 
+// With a shell background set and no client, the whole frame is the background
+// image, not the clear colour: this proves the background composites through the
+// real renderer (import the bytes, draw them behind the scene) and reads back,
+// the same headless pixman path the window test above uses. Clearing it returns
+// to the clear colour.
+#[test]
+fn shell_background_fills_the_frame() {
+    let _ = runtime_dir();
+    let mut comp = Compositor::new().expect("start compositor");
+    let (ow, oh) = comp.output_size();
+    assert!(ow > 0 && oh > 0);
+
+    // A solid opaque-magenta RGBA buffer the size of the output (R, G, B, A).
+    let mut rgba = vec![0u8; ow as usize * oh as usize * 4];
+    for px in rgba.chunks_exact_mut(4) {
+        px.copy_from_slice(&[0xFF, 0x00, 0xFF, 0xFF]);
+    }
+    comp.set_shell_background(&rgba, ow, oh);
+
+    let frame = comp.render().expect("render");
+    for (x, y) in [
+        (0u32, 0u32),
+        (ow as u32 / 2, oh as u32 / 2),
+        (ow as u32 - 1, oh as u32 - 1),
+    ] {
+        let got = frame.argb(x, y);
+        assert_eq!(got, MAGENTA, "background pixel at {x},{y} was {got:#010x}");
+    }
+
+    comp.set_shell_background(&[], 0, 0);
+    let frame = comp.render().expect("render");
+    assert_eq!(
+        frame.argb(0, 0),
+        BLACK,
+        "cleared background should be black"
+    );
+}
+
 struct App;
 
 impl Dispatch<WlRegistry, GlobalListContents> for App {

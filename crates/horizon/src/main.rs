@@ -156,6 +156,13 @@ enum CompositorOp {
         /// Seconds to wait for a client window before rendering
         #[arg(long, default_value_t = 10)]
         seconds: u64,
+        /// Draw the Glass surface of this store as the shell background (the L5
+        /// home screen), then composite any client windows over it
+        #[arg(long)]
+        background: Option<PathBuf>,
+        /// Window to summarize for the background Glass surface, in days
+        #[arg(long, default_value_t = 7)]
+        days: u64,
     },
     /// Open a nested window and show client windows on screen. Needs a Wayland
     /// or X session to nest in and a GPU; verified by eye, not in CI.
@@ -807,7 +814,12 @@ fn compositor_cmd(op: CompositorOp) -> Result<()> {
     match op {
         CompositorOp::Run => compositor_run(),
         #[cfg(feature = "compositor-render")]
-        CompositorOp::Screenshot { out, seconds } => compositor_screenshot(&out, seconds),
+        CompositorOp::Screenshot {
+            out,
+            seconds,
+            background,
+            days,
+        } => compositor_screenshot(&out, seconds, background.as_deref(), days),
         #[cfg(feature = "compositor-winit")]
         CompositorOp::Show => compositor_show(),
         #[cfg(feature = "compositor-udev")]
@@ -887,13 +899,35 @@ fn compositor_run() -> Result<()> {
 // software (pixman) renderer turns client buffers into pixels with no display or
 // GPU, so the image opens anywhere. Waits up to `seconds` for a window to map.
 #[cfg(all(target_os = "linux", feature = "compositor-render"))]
-fn compositor_screenshot(out: &Path, seconds: u64) -> Result<()> {
+fn compositor_screenshot(
+    out: &Path,
+    seconds: u64,
+    background: Option<&Path>,
+    days: u64,
+) -> Result<()> {
     compositor_ensure_runtime_dir()?;
 
     let mut comp = compositor::Compositor::new().context("start compositor")?;
     let socket = comp.socket_name().to_string_lossy().into_owned();
     println!("compositor: software renderer (no display needed)");
     println!("compositor: listening on WAYLAND_DISPLAY={socket}");
+
+    // Draw the store's Glass surface as the shell background (the L5 home screen),
+    // at the output size, before compositing any client windows over it.
+    if let Some(store) = background {
+        let (w, h) = comp.output_size();
+        let mut b = open_broker(store)?;
+        let g = glass::Glass::new(&mut b);
+        let window = glass::Window::days(now_unix(), days);
+        let model = g.model_within(window, glass::DEFAULT_BUCKETS)?;
+        let pm = glass::render(&model, w as u32, h as u32, 2);
+        comp.set_shell_background(&pm.rgba, w, h);
+        println!(
+            "compositor: Glass shell background from {}",
+            store.display()
+        );
+    }
+
     println!("compositor: waiting up to {seconds}s for a client window, then rendering");
     io::stdout().flush().ok();
 
@@ -918,7 +952,7 @@ fn compositor_screenshot(out: &Path, seconds: u64) -> Result<()> {
         frame.height,
         out.display()
     );
-    if count == 0 {
+    if count == 0 && background.is_none() {
         println!("compositor: (no client connected, so the image is just the clear colour)");
     }
     Ok(())

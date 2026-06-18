@@ -14,8 +14,9 @@
 //! and eye-verified on bare metal.
 //!
 //! Single GPU, single output, no hotplug: the first connected connector is bound
-//! at startup. Multi-GPU, connector hotplug, and VT-switch buffer recovery come
-//! later; the seat routing and compositing they would feed already exist.
+//! at startup. A VT switch away and back is recovered (the device and swapchain
+//! are reset on reactivation). Multi-GPU and connector hotplug come later; the
+//! seat routing and compositing they would feed already exist.
 
 use std::time::{Duration, Instant};
 
@@ -285,10 +286,19 @@ fn setup(loop_handle: LoopHandle<'static, DrmBackend>) -> Result<DrmBackend> {
                 if backend.libinput.resume().is_err() {
                     eprintln!("compositor: libinput resume failed");
                 }
-                if let Err(e) = backend.output_manager.activate(false) {
+                // Coming back from a VT switch, DRM master was lost while away, so
+                // the kernel's mode/plane state and our swapchain are both stale.
+                // activate(true) re-acquires master and reset_state()s the device
+                // and every surface; reset_buffers() drops the swapchain so the
+                // next frame reallocates and reprograms the mode from scratch.
+                if let Err(e) = backend.output_manager.activate(true) {
                     eprintln!("compositor: drm reactivate failed: {e}");
                 }
+                backend.surface.reset_buffers();
                 backend.active = true;
+                // Any frame in flight when we were paused will never get its
+                // vblank, so clear the pending flag and let the loop draw a fresh
+                // full frame against the reset buffers.
                 backend.frame_pending = false;
             }
         })

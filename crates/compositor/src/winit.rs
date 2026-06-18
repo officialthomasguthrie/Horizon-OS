@@ -9,17 +9,22 @@
 //! a GLES renderer in place of the offscreen pixman one. Only the windowing and
 //! the GL present are new here.
 //!
-//! It is a viewer for now: it shows every client window but does not yet forward
-//! input to them (keyboard and pointer focus come next), and a real DRM/KMS
-//! backend for bare metal comes after.
+//! Input is forwarded: the window's keyboard and pointer events are translated
+//! into seat actions on the compositor ([`Compositor::pointer_motion`] and the
+//! rest), so a nested client is focusable and usable, not just visible. A real
+//! DRM/KMS + libinput backend for bare metal comes after.
 
 use std::time::{Duration, Instant};
 
+use smithay::backend::input::{
+    AbsolutePositionEvent, Axis, ButtonState, InputEvent, KeyState, KeyboardKeyEvent,
+    PointerAxisEvent, PointerButtonEvent,
+};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::Color32F;
-use smithay::backend::winit::{self, WinitEvent};
+use smithay::backend::winit::{self, WinitEvent, WinitInput};
 use smithay::reexports::winit::platform::pump_events::PumpStatus;
-use smithay::utils::{Rectangle, Transform};
+use smithay::utils::{Logical, Rectangle, Size, Transform};
 
 use crate::render::paint_space;
 use crate::{Compositor, Error, Result};
@@ -38,16 +43,25 @@ pub(crate) fn run(comp: &mut Compositor) -> Result<()> {
 
     loop {
         let mut closed = false;
-        // Input forwarding to clients comes later; resize keeps the window's own
-        // size, which `window_size()` reports each frame. So only the close
-        // request matters here.
-        let status = winit.dispatch_new_events(|event| {
-            if let WinitEvent::CloseRequested = event {
-                closed = true;
-            }
+        let mut inputs: Vec<InputEvent<WinitInput>> = Vec::new();
+        // A resize keeps the window's own size, which `window_size()` reports
+        // each frame, so we only collect input and the close request here.
+        let status = winit.dispatch_new_events(|event| match event {
+            WinitEvent::CloseRequested => closed = true,
+            WinitEvent::Input(event) => inputs.push(event),
+            _ => {}
         });
         if closed || matches!(status, PumpStatus::Exit(_)) {
             return Ok(());
+        }
+
+        // Route this batch of input to the focused client(s) before rendering.
+        // Pointer positions arrive normalized to the window, so scale them to the
+        // output the scene lives on.
+        let (ow, oh) = comp.output_size();
+        let output = Size::<i32, Logical>::from((ow, oh));
+        for event in inputs {
+            apply_input(comp, event, output);
         }
 
         // Service Wayland clients (accept, dispatch, flush) between frames.
@@ -75,5 +89,30 @@ pub(crate) fn run(comp: &mut Compositor) -> Result<()> {
 
         // Let animating clients draw their next frame.
         comp.send_frames(start.elapsed().as_millis() as u32);
+    }
+}
+
+// Translate one winit input event into a seat action on the compositor. The
+// pointer position is normalized to the window, so it scales to `output`; winit
+// reports X keymap keycodes (evdev + 8), which the seat API takes as evdev.
+fn apply_input(comp: &mut Compositor, event: InputEvent<WinitInput>, output: Size<i32, Logical>) {
+    match event {
+        InputEvent::PointerMotionAbsolute { event } => {
+            let pos = event.position_transformed(output);
+            comp.pointer_motion(pos.x, pos.y);
+        }
+        InputEvent::PointerButton { event } => {
+            comp.pointer_button(event.button_code(), event.state() == ButtonState::Pressed);
+        }
+        InputEvent::PointerAxis { event } => {
+            let h = event.amount(Axis::Horizontal).unwrap_or(0.0);
+            let v = event.amount(Axis::Vertical).unwrap_or(0.0);
+            comp.pointer_axis(h, v);
+        }
+        InputEvent::Keyboard { event } => {
+            let evdev = event.key_code().raw().saturating_sub(8);
+            comp.keyboard_key(evdev, event.state() == KeyState::Pressed);
+        }
+        _ => {}
     }
 }

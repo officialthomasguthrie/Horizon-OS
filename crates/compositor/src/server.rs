@@ -5,10 +5,12 @@
 use std::ffi::{OsStr, OsString};
 use std::os::fd::AsFd;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use smithay::desktop::{Space, Window};
-use smithay::input::pointer::CursorImageStatus;
+use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState};
+use smithay::desktop::{Space, Window, WindowSurfaceType};
+use smithay::input::keyboard::{FilterResult, Keycode};
+use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
@@ -20,7 +22,7 @@ use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
-use smithay::utils::{Serial, Transform};
+use smithay::utils::{Logical, Point, Serial, Transform, SERIAL_COUNTER};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     with_states, CompositorClientState, CompositorHandler, CompositorState,
@@ -46,10 +48,9 @@ struct State {
     shm: ShmState,
     xdg: XdgShellState,
     seats: SeatState<State>,
-    // The seat global and the output global are advertised for their lifetime;
-    // we hold them so they are not withdrawn, even though we do not read them
-    // back yet (no input backend, no second output).
-    #[allow(dead_code)]
+    // The seat carries the keyboard and pointer; the input methods below drive
+    // it. The output global is advertised for its lifetime and held so it is not
+    // withdrawn (we do not read `outputs` back: there is only the one output).
     seat: Seat<State>,
     #[allow(dead_code)]
     outputs: OutputManagerState,
@@ -59,6 +60,11 @@ struct State {
     // Where the next toplevel is placed. Without a real layout we just step
     // windows across so several are distinct in the scene.
     next_x: i32,
+    // Last pointer position in output-logical pixels, so a click can pick the
+    // window under the cursor for keyboard focus.
+    pointer_loc: Point<f64, Logical>,
+    // Monotonic base for input event timestamps.
+    start: Instant,
 }
 
 impl State {
@@ -69,6 +75,145 @@ impl State {
             .elements()
             .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(surface))
             .cloned()
+    }
+}
+
+// Input routing. A display/input backend feeds the compositor raw events (the
+// winit backend now, a libinput one on bare metal later); a headless test drives
+// the same methods directly. The seat does the wire work (sending enter/leave,
+// motion, keys); these decide where each event lands: pointer focus follows the
+// cursor, a click focuses the window under it, and keys go to that focus.
+impl State {
+    fn now_ms(&self) -> u32 {
+        self.start.elapsed().as_millis() as u32
+    }
+
+    // The client surface under a point in output space, with its location, or
+    // None over empty space. This is the pointer's focus target.
+    fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let (window, win_loc) = self.space.element_under(pos)?;
+        let (surface, surf_loc) =
+            window.surface_under(pos - win_loc.to_f64(), WindowSurfaceType::ALL)?;
+        Some((surface, (win_loc + surf_loc).to_f64()))
+    }
+
+    // Give the keyboard to the toplevel under `pos` (click to focus): raise it,
+    // mark it activated and the rest not, and point the keyboard at it. Over
+    // empty space this clears focus.
+    fn focus_at(&mut self, pos: Point<f64, Logical>, serial: Serial) {
+        let window = self.space.element_under(pos).map(|(w, _)| w.clone());
+        if let Some(window) = &window {
+            self.space.raise_element(window, true);
+        }
+        let target = window
+            .as_ref()
+            .and_then(|w| w.toplevel())
+            .map(|t| t.wl_surface().clone());
+        for w in self.space.elements() {
+            let Some(toplevel) = w.toplevel() else {
+                continue;
+            };
+            let active = Some(toplevel.wl_surface()) == target.as_ref();
+            toplevel.with_pending_state(|s| {
+                if active {
+                    s.states.set(xdg_toplevel::State::Activated);
+                } else {
+                    s.states.unset(xdg_toplevel::State::Activated);
+                }
+            });
+            // Only sends if the activation actually changed.
+            toplevel.send_pending_configure();
+        }
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, target, serial);
+        }
+    }
+
+    fn pointer_motion(&mut self, x: f64, y: f64) {
+        let pos = Point::<f64, Logical>::from((x, y));
+        self.pointer_loc = pos;
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let focus = self.surface_under(pos);
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = self.now_ms();
+        pointer.motion(
+            self,
+            focus,
+            &MotionEvent {
+                location: pos,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn pointer_button(&mut self, button: u32, pressed: bool) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = self.now_ms();
+        let state = if pressed {
+            ButtonState::Pressed
+        } else {
+            ButtonState::Released
+        };
+        // A press picks the keyboard focus from the window under the cursor.
+        if pressed {
+            let loc = self.pointer_loc;
+            self.focus_at(loc, serial);
+        }
+        pointer.button(
+            self,
+            &ButtonEvent {
+                serial,
+                time,
+                button,
+                state,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn pointer_axis(&mut self, horizontal: f64, vertical: f64) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let mut frame = AxisFrame::new(self.now_ms()).source(AxisSource::Continuous);
+        if horizontal != 0.0 {
+            frame = frame.value(Axis::Horizontal, horizontal);
+        }
+        if vertical != 0.0 {
+            frame = frame.value(Axis::Vertical, vertical);
+        }
+        pointer.axis(self, frame);
+        pointer.frame(self);
+    }
+
+    fn keyboard_key(&mut self, keycode: u32, pressed: bool) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = self.now_ms();
+        let state = if pressed {
+            KeyState::Pressed
+        } else {
+            KeyState::Released
+        };
+        // Evdev keycodes sit 8 below the X keymap codes xkb compiles to; the
+        // wire event is mapped back down by the seat.
+        keyboard.input::<(), _>(
+            self,
+            Keycode::from(keycode + 8),
+            state,
+            serial,
+            time,
+            |_, _, _| FilterResult::Forward,
+        );
     }
 }
 
@@ -87,9 +232,12 @@ impl CompositorHandler for State {
         #[cfg(feature = "render")]
         smithay::backend::renderer::utils::on_commit_buffer_handler::<State>(surface);
 
-        // xdg-shell requires a configure before the client attaches a buffer.
-        // The client's initial commit (no buffer) is our cue to send it.
         if let Some(window) = self.window_for(surface) {
+            // Refresh the window's cached geometry from the new buffer, so the
+            // scene bbox (and pointer hit-testing) tracks the client's size.
+            window.on_commit();
+            // xdg-shell requires a configure before the client attaches a buffer.
+            // The client's initial commit (no buffer) is our cue to send it.
             if let Some(toplevel) = window.toplevel() {
                 if !toplevel.is_initial_configure_sent() {
                     toplevel.send_configure();
@@ -253,6 +401,8 @@ impl Compositor {
             output,
             space,
             next_x: 0,
+            pointer_loc: (0.0, 0.0).into(),
+            start: Instant::now(),
         };
 
         // New clients arrive here.
@@ -329,6 +479,38 @@ impl Compositor {
                 })
             })
             .collect()
+    }
+
+    /// Move the pointer to `(x, y)` in output-logical pixels and refocus it on
+    /// the surface there (sending the client enter/leave and motion). A display
+    /// backend drives this (the winit backend now, libinput on bare metal later);
+    /// a test drives it directly.
+    pub fn pointer_motion(&mut self, x: f64, y: f64) {
+        self.state.pointer_motion(x, y);
+    }
+
+    /// Press or release a pointer `button` (a Linux evdev code, e.g. BTN_LEFT is
+    /// 0x110). A press also gives the keyboard to the window under the pointer.
+    pub fn pointer_button(&mut self, button: u32, pressed: bool) {
+        self.state.pointer_button(button, pressed);
+    }
+
+    /// Scroll the focused surface by the given horizontal and vertical amounts.
+    pub fn pointer_axis(&mut self, horizontal: f64, vertical: f64) {
+        self.state.pointer_axis(horizontal, vertical);
+    }
+
+    /// Press or release `keycode` (a Linux evdev keycode, e.g. KEY_A is 30) on
+    /// the keyboard-focused client. A no-op when nothing holds focus or the host
+    /// has no keyboard.
+    pub fn keyboard_key(&mut self, keycode: u32, pressed: bool) {
+        self.state.keyboard_key(keycode, pressed);
+    }
+
+    /// Whether the seat has a keyboard. A host with no xkb data has none, and the
+    /// keyboard path is then a no-op; callers gate keyboard assertions on this.
+    pub fn has_keyboard(&self) -> bool {
+        self.state.seat.get_keyboard().is_some()
     }
 
     /// Composite the current scene into an offscreen framebuffer the size of the

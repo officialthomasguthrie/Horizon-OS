@@ -18,6 +18,14 @@
 //!   machines. The compositing it runs is the shared, tested path; only the
 //!   windowing and GL present are new. A real DRM/KMS backend comes after.
 //!
+//! Input is routed through the seat by [`Compositor::pointer_motion`] and the
+//! other input methods: pointer focus follows the cursor, a click focuses the
+//! window under it, and keys go to that focus. A display backend feeds them raw
+//! events (the `winit` one now, a libinput one on bare metal later). Like the
+//! compositing, this routing is proven headlessly, a real client is checked to
+//! receive the right enter/motion/button and key events, so only the backend
+//! plumbing waits for a screen.
+//!
 //! Each app on Horizon is meant to be a confined Wayland client living in a
 //! Cell; the exec path that makes that real already exists in the `cells`
 //! crate. Glass, the live transparency surface over the Weave audit log, will

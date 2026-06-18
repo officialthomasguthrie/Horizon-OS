@@ -348,23 +348,49 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   darwin host, which has no display; the on-screen result awaits a real Linux
   session for eye-verification, and a real DRM/KMS backend for bare metal comes
   after.
+- Phase 3 compositor input routing (`compositor`, Linux): forward keyboard and
+  pointer input to client windows, so the on-screen viewer is usable, not just a
+  picture. The seat already carried a keyboard and a pointer; now the `Compositor`
+  drives them. `pointer_motion` refocuses the pointer on the surface under the
+  cursor (the seat sends the client enter/leave and motion), `pointer_button`
+  clicks and on a press gives the keyboard to the window under the cursor (raising
+  it and marking it xdg-activated, the rest not), `pointer_axis` scrolls, and
+  `keyboard_key` forwards keys to that focus. The focus policy is the usual one:
+  pointer focus follows the cursor, the keyboard is click-to-focus. This routing
+  is not tied to a backend: a display backend feeds it raw events (the winit
+  backend now translates winit's `WinitEvent::Input`; a libinput one on bare metal
+  later), so, like the compositing, it is proven headlessly. A new CI test drives
+  the input methods directly against a real in-process Wayland client that maps a
+  buffer and binds the seat, and asserts the client receives the right events: a
+  pointer enter on its own surface, a motion, a BTN_LEFT press, and, where the
+  seat has an xkb keyboard, a keyboard enter and a KEY_A press; the held-button
+  pointer grab and the evdev/xkb keycode offset (Wayland codes sit 8 below xkb's)
+  are handled, and the keyboard checks are skipped where the host has no xkb data.
+  It also fixed a real bug the input path exposed: the commit handler never called
+  `Window::on_commit`, so a window's cached bbox stayed zero and nothing was
+  hit-testable; rendering never noticed (it walks the surface tree directly) but
+  pointer focus did. The winit backend's input translation needs a display, so it
+  is compile-checked in CI and eye-verified later, exactly like the on-screen
+  present. Green as root and as the unprivileged dev user.
 
 ## Next
 
 - Phase 3: the experience layer. The compositor's headless core (a real Wayland
-  server: the core globals, the xdg-shell toplevel lifecycle, the scene graph) and
+  server: the core globals, the xdg-shell toplevel lifecycle, the scene graph),
   its software renderer (importing client shm buffers and compositing the Space
-  into an offscreen framebuffer, asserted on pixel by pixel) are done and CI-
-  tested; the on-screen winit backend is written and compile-checked. The next
-  step is the eye part: run `horizon compositor show` on a real Linux session and
-  watch a client's window appear in the nested compositor window (this host is a
-  display-less darwin Mac driving a headless Linux container, so this is the piece
-  that genuinely waits for hardware). Then forward input (keyboard and pointer
-  focus) to the client windows so the viewer becomes usable, then a real DRM/KMS +
-  libinput backend for bare metal. After that, the shell proper, iced + wgpu with
-  the Aura intent line as launcher and command palette, and Glass as an L5
-  compositor surface over the weave audit log. Confined cells can already host
-  compositor surfaces (the cells exec path is ready). Linux-only.
+  into an offscreen framebuffer, asserted on pixel by pixel), and its input
+  routing (pointer focus follows the cursor, click to focus, keys to the focused
+  client) are done and CI-tested; the on-screen winit backend, which presents the
+  scene and translates the window's input, is written and compile-checked. The
+  next step is the eye part: run `horizon compositor show` on a real Linux
+  session, watch a client's window appear in the nested compositor window, and
+  click and type into it (this host is a display-less darwin Mac driving a
+  headless Linux container, so this is the piece that genuinely waits for
+  hardware). Then a real DRM/KMS + libinput backend for bare metal. After that,
+  the shell proper, iced + wgpu with the Aura intent line as launcher and command
+  palette, and Glass as an L5 compositor surface over the weave audit log.
+  Confined cells can already host compositor surfaces (the cells exec path is
+  ready). Linux-only.
 - Glass: the live transparency surface over the weave audit log. It lands as a
   compositor surface now there is a renderer to draw it on (the `render`/`winit`
   features above); `horizon weave audit/grants` is the headless stand-in until the

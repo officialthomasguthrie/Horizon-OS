@@ -829,8 +829,9 @@ fn write_ppm(path: &Path, frame: &compositor::RenderedFrame) -> io::Result<()> {
 }
 
 // Run the on-screen winit backend: a real window, nested in the current Wayland
-// or X session, showing the client windows the compositor manages. This is the
-// part that needs a display and a GPU, so it is verified by eye.
+// or X session, showing the client windows the compositor manages and forwarding
+// keyboard and pointer input to them. This is the part that needs a display and a
+// GPU, so it is verified by eye.
 #[cfg(all(target_os = "linux", feature = "compositor-winit"))]
 fn compositor_show() -> Result<()> {
     compositor_ensure_runtime_dir()?;
@@ -840,6 +841,7 @@ fn compositor_show() -> Result<()> {
     println!("compositor: on-screen (winit) backend, nested in the current session");
     println!("compositor: listening on WAYLAND_DISPLAY={socket}");
     println!("compositor: connect a client, e.g.  WAYLAND_DISPLAY={socket} <wayland-app>");
+    println!("compositor: click a window to focus it; keyboard and pointer go to it");
     println!("compositor: close the window to stop");
     io::stdout().flush().ok();
 

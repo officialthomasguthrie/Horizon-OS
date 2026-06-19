@@ -62,6 +62,12 @@ struct State {
     // drawing it needs a renderer.
     #[cfg(feature = "render")]
     background: Option<crate::render::ShellBackground>,
+    // Bumped on every `set_shell_background`. The DRM backend caches an upload of
+    // the background and rebuilds it only when this changes, so an idle desktop is
+    // not re-uploaded each frame (which would defeat its damage tracking). Only the
+    // DRM path caches, so this is udev-gated; winit redraws every frame regardless.
+    #[cfg(feature = "udev")]
+    background_gen: u64,
     // Where the next toplevel is placed. Without a real layout we just step
     // windows across so several are distinct in the scene.
     next_x: i32,
@@ -417,6 +423,8 @@ impl Compositor {
             space,
             #[cfg(feature = "render")]
             background: None,
+            #[cfg(feature = "udev")]
+            background_gen: 0,
             next_x: 0,
             pointer_loc: (0.0, 0.0).into(),
             pending_shell_click: None,
@@ -563,12 +571,25 @@ impl Compositor {
         let ok = width > 0 && height > 0 && rgba.len() >= (width as usize * height as usize * 4);
         self.state.background =
             ok.then(|| crate::render::ShellBackground::new(rgba.to_vec(), width, height));
+        // A change (including a clear) invalidates the DRM backend's cached upload.
+        #[cfg(feature = "udev")]
+        {
+            self.state.background_gen = self.state.background_gen.wrapping_add(1);
+        }
     }
 
-    // The shell background the winit backend paints behind the scene, if set.
-    #[cfg(feature = "winit")]
+    // The shell background an on-screen backend paints behind the scene, if set.
+    #[cfg(any(feature = "winit", feature = "udev"))]
     pub(crate) fn background(&self) -> Option<&crate::render::ShellBackground> {
         self.state.background.as_ref()
+    }
+
+    // A counter bumped on every `set_shell_background`, so the DRM backend knows
+    // when to rebuild its cached background upload (an unchanged value means the
+    // desktop is unchanged and the upload can be reused).
+    #[cfg(feature = "udev")]
+    pub(crate) fn background_generation(&self) -> u64 {
+        self.state.background_gen
     }
 
     /// The output's pixel size (width, height). The offscreen framebuffer and the
@@ -625,8 +646,17 @@ impl Compositor {
     /// frames. This is the bare-metal path Horizon boots into; it takes over a
     /// seat and a GPU, so it runs on a console (not nested), and is eye-verified
     /// on hardware.
+    ///
+    /// `on_shell_click` works exactly as in [`show`](Compositor::show): each pointer
+    /// press that lands on the shell background (no client window over it) is offered
+    /// to it, and returning new full-screen RGBA redraws the background, the path a
+    /// click on a Glass `sever` button takes. Pass a closure that always returns
+    /// `None` when there is no interactive shell.
     #[cfg(feature = "udev")]
-    pub fn run_drm(&mut self) -> Result<()> {
-        crate::drm::run(self)
+    pub fn run_drm(
+        &mut self,
+        on_shell_click: impl FnMut(i32, i32) -> Option<Vec<u8>>,
+    ) -> Result<()> {
+        crate::drm::run(self, on_shell_click)
     }
 }

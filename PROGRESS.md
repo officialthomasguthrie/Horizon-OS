@@ -535,6 +535,37 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   --background <store>` draws the clickable Glass desktop. The coordinates line up
   because the shell renders at output scale 1, so a logical click indexes the
   surface's own pixels directly.
+- Phase 3 Glass desktop on the DRM backend (`compositor` `udev` feature + `horizon`):
+  the bare-metal path now draws the Glass shell background behind client windows and
+  routes a `sever` click through the broker, the same clickable desktop the winit
+  backend shows, now straight off the GPU. The winit/pixman `paint_space` draws the
+  background by uploading it and calling `render_texture_at` directly, but the DRM
+  present loop hands `DrmOutput::render_frame` a homogeneous element list, so the
+  background has to be a `RenderElement`. It becomes a `MemoryRenderBufferRenderElement`
+  (the CPU-bytes-to-scanout path), unified with the window surfaces under one
+  `render_elements!` enum (`ShellElement`, Surface or Background) and appended last so
+  it sits behind the windows (render_frame draws front to back). That element needs
+  `R::TextureId: Send`, which the multi-GPU renderer's `MultiTexture` is but the pixman
+  texture is not, which is exactly why this path is DRM-only and the pixman one draws
+  directly. The upload is cached: a `MemoryRenderBuffer` is rebuilt only when the
+  compositor's background generation changes (`set_shell_background` bumps it), so an
+  idle desktop is not re-uploaded each frame, which would pin the GPU at full redraw
+  and defeat the backend's damage-based present skip; the buffer re-uploads only its
+  damaged regions and caches the texture per GPU context, so one shared buffer serves
+  every output and GPU. The sever click is wired exactly as winit: `run_drm` now takes
+  the same `on_shell_click` closure, the loop offers each press that hit no client
+  window to it and sets any returned redraw as the new background. The enum is built in
+  a small submodule because `render_elements!` expands to a bare `Result` that would
+  otherwise bind to the crate's `Result` alias. `horizon compositor drm --background
+  <store> [--days N]` draws the clickable desktop on bare metal, the interactive
+  `Shell` now shared by `show` and `drm`. Same split as the rest of the DRM backend:
+  compile-checked and clippy-clean under `udev` in CI, eye-verified on hardware next,
+  while the pieces it composes are already headless-tested (the click primitive in the
+  compositor, the resolve-and-sever chain in glass, the background compositing on the
+  pixman path). The shell renders at the compositor's logical output size and is drawn
+  at the output origin, so on a larger monitor it sits top-left, the same single-scene
+  limitation the rest of the DRM backend has. Built and compile-checked from the Linux
+  container on this display-less darwin host.
 
 ## Next
 
@@ -565,11 +596,14 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   Glass `sever` button is now routed back through `Glass::sever`: the compositor
   reports a press that hit no client window, Horizon resolves it through the scene
   and severs, then redraws the surface, wired into `horizon compositor show
-  --background`. What is left on the shell: painting that background (and so this
-  click loop) on the DRM backend (its element-list present loop needs the Send-able
-  multi-GPU texture path), refreshing it live as the audit log changes from outside,
-  and the Aura intent line becoming a real launcher/command palette. Confined cells
-  can already host compositor surfaces (the cells exec path is ready). Linux-only.
+  --background`, and now on the bare-metal DRM backend too: the background is painted
+  as a `MemoryRenderBufferRenderElement` behind the windows (the Send-able multi-GPU
+  texture path the element-list present loop needs) and the sever click runs through
+  the same `on_shell_click` closure, behind `horizon compositor drm --background`.
+  What is left on the shell: refreshing the background live as the audit log changes
+  from outside, and the Aura intent line becoming a real launcher/command palette.
+  Confined cells can already host compositor surfaces (the cells exec path is ready).
+  Linux-only.
 - Glass: the live transparency surface over the weave audit log. The model layer
   and the drawn surface are both done (the `glass` crate: a pure fold of the
   broker's grant table and audit log into a per-principal map of
@@ -584,9 +618,11 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   --background <store>` shows it), and a click on a `sever` hit target is now routed
   back through `Glass::sever` (the compositor reports the press, Horizon resolves it
   through `Scene::action_at` and severs, then redraws), behind `horizon compositor
-  show --background`. What is left: painting it on the DRM backend and refreshing it
-  live as the log changes from outside. Eye-verify on a screen; a confined cell can
-  host it (the cells exec path is ready).
+  show --background`, and on the bare-metal DRM backend behind `horizon compositor
+  drm --background` (the background drawn as a `MemoryRenderBufferRenderElement`, the
+  click routed the same way). What is left: refreshing it live as the log changes
+  from outside. Eye-verify on a screen; a confined cell can host it (the cells exec
+  path is ready).
 - Phase 5 Constellation real-host verification: the whole networking stack that
   can be built and tested on one host is done and in CI, the QUIC + Noise
   transport, serve/sync CLI, concurrent multi-peer serving, mDNS LAN discovery,

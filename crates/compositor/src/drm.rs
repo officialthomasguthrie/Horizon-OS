@@ -41,7 +41,11 @@ use smithay::backend::input::{
     PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+use smithay::backend::renderer::element::memory::{
+    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
+};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiRenderer};
@@ -71,6 +75,30 @@ type DrmAlloc = GbmAllocator<DrmDeviceFd>;
 type DrmExport = GbmFramebufferExporter<DrmDeviceFd>;
 type OutputManager = DrmOutputManager<DrmAlloc, DrmExport, (), DrmDeviceFd>;
 type DrmOut = DrmOutput<DrmAlloc, DrmExport, (), DrmDeviceFd>;
+
+// A frame here draws two kinds of element: client window surfaces and, behind
+// them, the shell background. `DrmOutput::render_frame` takes a homogeneous slice,
+// so they unify into one enum. The background is a `MemoryRenderBufferRenderElement`
+// (CPU bytes uploaded for scanout), the path the multi-GPU renderer's `Send`-able
+// texture supports but the pixman one does not, which is why the offscreen/winit
+// `paint_space` draws the background directly instead of as an element.
+//
+// In its own module because `render_elements!` expands to code that names a bare
+// `Result`, which would otherwise resolve to this file's `crate::Result` alias
+// (two of its arms then break); inside `elements` `Result` is still the std one.
+mod elements {
+    use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
+    use smithay::backend::renderer::element::render_elements;
+    use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+    use smithay::backend::renderer::{ImportAll, ImportMem};
+
+    render_elements! {
+        pub ShellElement<R> where R: ImportMem + ImportAll;
+        Surface = WaylandSurfaceRenderElement<R>,
+        Background = MemoryRenderBufferRenderElement<R>,
+    }
+}
+use elements::ShellElement;
 
 // 8-bit scanout formats, which every GPU and panel handles; Horizon does not need
 // the deeper formats yet. The order is the swapchain preference order.
@@ -129,6 +157,13 @@ struct DrmBackend {
     cursor: Point<f64, Logical>,
     // Cursor clamp bounds: the primary output's mode size.
     output_size: Size<i32, Logical>,
+    // The shell background uploaded for scanout, drawn behind every window. Shared
+    // across every GPU and output (each imports it into its own renderer context
+    // lazily, only re-uploading damaged regions). None when no background is set.
+    background: Option<MemoryRenderBuffer>,
+    // The compositor background generation `background` was built from, so an
+    // unchanged desktop is rebuilt and re-uploaded at most once, not every frame.
+    background_gen: u64,
     // Whether the session owns the GPUs right now (false while switched away).
     active: bool,
 }
@@ -136,7 +171,10 @@ struct DrmBackend {
 /// Bring up the DRM/KMS backend and run it until the process is stopped. Drives
 /// the Wayland server (`comp`) between frames, so clients connect and map exactly
 /// as in the headless core; their windows are then scanned out to every screen.
-pub(crate) fn run(comp: &mut Compositor) -> Result<()> {
+pub(crate) fn run(
+    comp: &mut Compositor,
+    mut on_shell_click: impl FnMut(i32, i32) -> Option<Vec<u8>>,
+) -> Result<()> {
     let mut event_loop: EventLoop<'static, DrmBackend> =
         EventLoop::try_new().map_err(|e| Error::Init(format!("event loop: {e}")))?;
     let mut backend = setup(event_loop.handle())?;
@@ -154,6 +192,16 @@ pub(crate) fn run(comp: &mut Compositor) -> Result<()> {
         let events = std::mem::take(&mut backend.input_events);
         for event in events {
             apply_input(comp, event, &mut backend.cursor, output_size);
+        }
+
+        // A press on the shell background (no client window over it) is offered to
+        // the owner; if it redraws the surface (e.g. a Glass `sever` button was
+        // clicked), set the new background, which the next frame uploads.
+        if let Some((x, y)) = comp.take_shell_click() {
+            if let Some(rgba) = on_shell_click(x, y) {
+                let (ow, oh) = comp.output_size();
+                comp.set_shell_background(&rgba, ow, oh);
+            }
         }
 
         // Service Wayland clients (accept, dispatch, flush) between frames.
@@ -175,6 +223,9 @@ pub(crate) fn run(comp: &mut Compositor) -> Result<()> {
 // empty one is retried next iteration (the dispatch timeout paces it).
 fn render_all(comp: &mut Compositor, backend: &mut DrmBackend) {
     let clear = Color32F::new(0.06, 0.06, 0.06, 1.0);
+    // Rebuild the cached background upload if the shell changed it (cheap when
+    // unchanged: just a generation compare).
+    backend.sync_background(comp);
     for device in backend.devices.values_mut() {
         let mut renderer = match backend.gpus.single_renderer(&device.render_node) {
             Ok(renderer) => renderer,
@@ -183,7 +234,27 @@ fn render_all(comp: &mut Compositor, backend: &mut DrmBackend) {
                 continue;
             }
         };
-        let elements = space_render_elements(&mut renderer, comp.space());
+        // The window surfaces, then the shell background appended last so it sits
+        // behind them (render_frame draws the element list front to back).
+        let mut elements: Vec<ShellElement<UdevRenderer>> =
+            space_render_elements(&mut renderer, comp.space())
+                .into_iter()
+                .map(ShellElement::Surface)
+                .collect();
+        if let Some(buffer) = &backend.background {
+            match MemoryRenderBufferRenderElement::from_buffer(
+                &mut renderer,
+                (0.0, 0.0),
+                buffer,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            ) {
+                Ok(element) => elements.push(ShellElement::Background(element)),
+                Err(e) => eprintln!("compositor: background upload: {e}"),
+            }
+        }
         for surface in device.surfaces.values_mut() {
             if surface.pending {
                 continue;
@@ -315,6 +386,8 @@ fn setup(loop_handle: LoopHandle<'static, DrmBackend>) -> Result<DrmBackend> {
         input_events: Vec::new(),
         cursor: Point::from((0.0, 0.0)),
         output_size: Size::from((1920, 1080)),
+        background: None,
+        background_gen: 0,
         active: true,
     };
 
@@ -338,6 +411,30 @@ fn setup(loop_handle: LoopHandle<'static, DrmBackend>) -> Result<DrmBackend> {
 }
 
 impl DrmBackend {
+    // Rebuild the cached background upload when the compositor's shell background
+    // changes (tracked by generation), so an unchanged desktop is uploaded at most
+    // once rather than every frame. A fresh `MemoryRenderBuffer` carries full damage
+    // and a new id, so the next frame redraws; the old upload's textures are freed
+    // when it drops. The bytes are `Abgr8888` (R, G, B, A), what `glass::Pixmap`
+    // produces, drawn at the buffer's native size at the output origin.
+    fn sync_background(&mut self, comp: &Compositor) {
+        let generation = comp.background_generation();
+        if generation == self.background_gen {
+            return;
+        }
+        self.background_gen = generation;
+        self.background = comp.background().map(|bg| {
+            MemoryRenderBuffer::from_slice(
+                bg.rgba(),
+                Fourcc::Abgr8888,
+                (bg.width(), bg.height()),
+                1,
+                Transform::Normal,
+                None,
+            )
+        });
+    }
+
     // Bring a GPU online: open it through the session, wire a GBM/GLES renderer and
     // a DRM output manager, register its vblank source, and scan its connectors for
     // displays to light. A failure on one GPU is logged and skipped, not fatal: the

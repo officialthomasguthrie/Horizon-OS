@@ -181,7 +181,15 @@ enum CompositorOp {
     /// This is the bare-metal path: run it from a console, not nested. Needs a
     /// GPU and a seat; verified by eye on hardware, not in CI.
     #[cfg(feature = "compositor-udev")]
-    Drm,
+    Drm {
+        /// Draw the Glass surface of this store as the shell background (the L5
+        /// home screen); clicking a `sever` button revokes that capability live
+        #[arg(long)]
+        background: Option<PathBuf>,
+        /// Window to summarize for the background Glass surface, in days
+        #[arg(long, default_value_t = 7)]
+        days: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -832,7 +840,7 @@ fn compositor_cmd(op: CompositorOp) -> Result<()> {
         #[cfg(feature = "compositor-winit")]
         CompositorOp::Show { background, days } => compositor_show(background.as_deref(), days),
         #[cfg(feature = "compositor-udev")]
-        CompositorOp::Drm => compositor_drm(),
+        CompositorOp::Drm { background, days } => compositor_drm(background.as_deref(), days),
     }
 }
 
@@ -1028,18 +1036,24 @@ fn compositor_show(background: Option<&Path>, days: u64) -> Result<()> {
     .context("run winit backend")
 }
 
-// The interactive Glass shell behind the winit backend. It holds the broker, the
-// window it summarizes, and the last scene it drew, so a pointer click can be
-// resolved against the scene's hit targets, applied through Glass, and the
-// surface redrawn. Lives only where the on-screen backend does.
-#[cfg(all(target_os = "linux", feature = "compositor-winit"))]
+// The interactive Glass shell behind an on-screen backend. It holds the broker,
+// the window it summarizes, and the last scene it drew, so a pointer click can be
+// resolved against the scene's hit targets, applied through Glass, and the surface
+// redrawn. Shared by the winit (`show`) and bare-metal (`drm`) backends.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "compositor-winit", feature = "compositor-udev")
+))]
 struct Shell {
     broker: Broker,
     window: glass::Window,
     scene: glass::Scene,
 }
 
-#[cfg(all(target_os = "linux", feature = "compositor-winit"))]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "compositor-winit", feature = "compositor-udev")
+))]
 impl Shell {
     // Open a store's Glass shell at a surface size, rendering the first frame.
     // Returns the shell and the RGBA to set as the background.
@@ -1099,8 +1113,15 @@ impl Shell {
 // and a console, so it is meant to be run from a TTY (e.g. under seatd or
 // logind), which is how Horizon boots into its shell on hardware. Needs a GPU and
 // a seat, so it is verified by eye on real hardware.
+//
+// With --background it draws the same clickable Glass shell the winit backend
+// does, behind the client windows, and routes a click on a `sever` button back
+// through Glass to revoke that capability and redraw, exactly as `show` does. The
+// shell is laid out at the compositor's logical output size, so on a larger
+// monitor it sits at the top-left, the same single-scene limitation the rest of
+// the DRM backend has.
 #[cfg(all(target_os = "linux", feature = "compositor-udev"))]
-fn compositor_drm() -> Result<()> {
+fn compositor_drm(background: Option<&Path>, days: u64) -> Result<()> {
     compositor_ensure_runtime_dir()?;
 
     let mut comp = compositor::Compositor::new().context("start compositor")?;
@@ -1109,10 +1130,32 @@ fn compositor_drm() -> Result<()> {
     println!("compositor: listening on WAYLAND_DISPLAY={socket}");
     println!("compositor: connect a client, e.g.  WAYLAND_DISPLAY={socket} <wayland-app>");
     println!("compositor: click a window to focus it; keyboard and pointer go to it");
+
+    // Optional clickable Glass shell, rendered at the output size, exactly as the
+    // winit backend draws it.
+    let (ow, oh) = comp.output_size();
+    let mut shell = match background {
+        Some(store) => {
+            let (shell, rgba) = Shell::open(store, days, ow as u32, oh as u32)?;
+            comp.set_shell_background(&rgba, ow, oh);
+            println!(
+                "compositor: Glass shell background from {} (click `sever` to revoke a capability)",
+                store.display()
+            );
+            Some(shell)
+        }
+        None => None,
+    };
+
     println!("compositor: switch VT or kill the process to stop");
     io::stdout().flush().ok();
 
-    comp.run_drm().context("run drm backend")
+    comp.run_drm(|x, y| {
+        shell
+            .as_mut()
+            .and_then(|s| s.click(x, y, ow as u32, oh as u32))
+    })
+    .context("run drm backend")
 }
 
 // Constellation sync. Both stores belong to one identity, so they share the

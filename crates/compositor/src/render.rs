@@ -57,6 +57,24 @@ impl ShellBackground {
             height,
         }
     }
+
+    // The raw bytes and size, for the DRM backend to rebuild a `MemoryRenderBuffer`
+    // (its element-list present loop cannot draw the texture directly the way
+    // `paint_space` does). The winit and pixman paths read the fields directly.
+    #[cfg(feature = "udev")]
+    pub(crate) fn rgba(&self) -> &[u8] {
+        &self.rgba
+    }
+
+    #[cfg(feature = "udev")]
+    pub(crate) fn width(&self) -> i32 {
+        self.width
+    }
+
+    #[cfg(feature = "udev")]
+    pub(crate) fn height(&self) -> i32 {
+        self.height
+    }
 }
 
 impl RenderedFrame {

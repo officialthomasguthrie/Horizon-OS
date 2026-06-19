@@ -105,6 +105,17 @@ fn shell_key(sym: Keysym) -> Option<ShellKey> {
     }
 }
 
+/// A handle to an output placed in the shared logical space via
+/// [`Compositor::add_output`], used to render or move it. Multi-monitor support:
+/// each output occupies its own region of one coordinate space, so a window lives
+/// at a single position across the whole desktop and each output paints only the
+/// part it covers. The DRM backend builds the same arrangement from real
+/// connectors; this id-based API is the headless way to set one up and read each
+/// output back, so per-output region rendering is provable without a display.
+#[cfg(feature = "render")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OutputId(u32);
+
 // Everything the protocol handlers touch. The `Compositor` keeps this next to
 // the `Display` so dispatch can hand it to both calloop and the Wayland core.
 struct State {
@@ -122,6 +133,16 @@ struct State {
     #[allow(dead_code)]
     output: Output,
     space: Space<Window>,
+    // Outputs placed in the shared logical space through the id-based API, keyed by
+    // their handle, so `render_output` can find one to read back and `move_output`
+    // can relocate it. The default `output` above is the always-present placeholder
+    // the single-output paths use; these are extra ones a multi-monitor setup maps
+    // in (the headless mirror of what the DRM backend builds from real connectors).
+    // Render-gated: it exists to drive the offscreen per-output readback.
+    #[cfg(feature = "render")]
+    extra_outputs: std::collections::HashMap<u32, Output>,
+    #[cfg(feature = "render")]
+    next_output_id: u32,
     // The shell background: the L5 home surface (Horizon draws Glass here) painted
     // behind every client window. None paints the clear color. Render-gated, since
     // drawing it needs a renderer.
@@ -508,6 +529,10 @@ impl Compositor {
             output,
             space,
             #[cfg(feature = "render")]
+            extra_outputs: std::collections::HashMap::new(),
+            #[cfg(feature = "render")]
+            next_output_id: 0,
+            #[cfg(feature = "render")]
             background: None,
             #[cfg(feature = "udev")]
             background_gen: 0,
@@ -658,6 +683,94 @@ impl Compositor {
             &self.state.output,
             self.state.background.as_ref(),
         )
+    }
+
+    /// Place an output of the given mode at logical position `(x, y)` in the one
+    /// shared desktop space and return a handle to it. This is the headless way to
+    /// build a multi-monitor arrangement: each added output owns its region, so a
+    /// window at a logical position shows on whichever output covers it and each
+    /// reads back only its own slice (the same per-output rendering the DRM backend
+    /// scans out from real connectors). The output advertises no `wl_output` global
+    /// (clients still see the default one), so it is a render/scene construct, not a
+    /// new thing clients enumerate.
+    #[cfg(feature = "render")]
+    pub fn add_output(&mut self, name: &str, width: i32, height: i32, x: i32, y: i32) -> OutputId {
+        let output = Output::new(
+            name.to_string(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Horizon".into(),
+                model: "Virtual".into(),
+            },
+        );
+        let mode = Mode {
+            size: (width, height).into(),
+            refresh: 60_000,
+        };
+        output.change_current_state(
+            Some(mode),
+            Some(Transform::Normal),
+            Some(Scale::Integer(1)),
+            Some((x, y).into()),
+        );
+        output.set_preferred(mode);
+        self.state.space.map_output(&output, (x, y));
+        let id = self.state.next_output_id;
+        self.state.next_output_id += 1;
+        self.state.extra_outputs.insert(id, output);
+        OutputId(id)
+    }
+
+    /// Move an added output to a new logical position, rearranging the desktop.
+    /// A no-op for an unknown handle.
+    #[cfg(feature = "render")]
+    pub fn move_output(&mut self, id: OutputId, x: i32, y: i32) {
+        if let Some(output) = self.state.extra_outputs.get(&id.0).cloned() {
+            self.state.space.map_output(&output, (x, y));
+        }
+    }
+
+    /// Remove an added output from the shared space. A no-op for an unknown handle.
+    #[cfg(feature = "render")]
+    pub fn remove_output(&mut self, id: OutputId) {
+        if let Some(output) = self.state.extra_outputs.remove(&id.0) {
+            self.state.space.unmap_output(&output);
+        }
+    }
+
+    /// Composite one added output's own region of the shared space into an
+    /// offscreen framebuffer the size of its mode and read the pixels back. The
+    /// window scene is shared across outputs, so this shows only what falls on this
+    /// output, offset to its logical origin: the headless proof that outputs render
+    /// their own region rather than mirroring the whole scene.
+    #[cfg(feature = "render")]
+    pub fn render_output(&mut self, id: OutputId) -> Result<crate::render::RenderedFrame> {
+        let output = self
+            .state
+            .extra_outputs
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| Error::Render("unknown output".into()))?;
+        crate::render::render_output(&self.state.space, &output, self.state.background.as_ref())
+    }
+
+    /// Place (or move) a real output in the shared logical space at `(x, y)`. The
+    /// DRM backend calls this for each connector it lights, so its outputs render
+    /// their own region exactly as the headless [`add_output`] ones do; it owns the
+    /// `Output` (it is also the `DrmOutput`'s mode source), so this takes it by
+    /// reference rather than minting one.
+    ///
+    /// [`add_output`]: Compositor::add_output
+    #[cfg(feature = "udev")]
+    pub(crate) fn map_output(&mut self, output: &Output, x: i32, y: i32) {
+        self.state.space.map_output(output, (x, y));
+    }
+
+    /// Remove a real output from the shared space (its connector was unplugged).
+    #[cfg(feature = "udev")]
+    pub(crate) fn unmap_output(&mut self, output: &Output) {
+        self.state.space.unmap_output(output);
     }
 
     /// Set the shell background: the full-screen image drawn behind every client

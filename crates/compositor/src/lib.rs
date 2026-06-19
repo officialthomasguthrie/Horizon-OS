@@ -49,6 +49,12 @@
 mod error;
 pub use error::{Error, Result};
 
+// Logical output layout: where each output sits in the one shared desktop
+// coordinate space. Pure integer math (no Wayland types), so it builds and
+// unit-tests on every host, not only Linux, the way the rest of the compositor's
+// testable core is exercised. The DRM backend feeds it real connector modes.
+pub mod layout;
+
 #[cfg(target_os = "linux")]
 mod server;
 #[cfg(target_os = "linux")]
@@ -68,6 +74,10 @@ pub use server::ShellKey;
 mod render;
 #[cfg(all(target_os = "linux", feature = "render"))]
 pub use render::RenderedFrame;
+// The handle to an output placed in the shared logical space (multi-monitor):
+// render-gated, since its only use is driving the offscreen per-output readback.
+#[cfg(all(target_os = "linux", feature = "render"))]
+pub use server::OutputId;
 
 #[cfg(all(target_os = "linux", feature = "winit"))]
 mod winit;

@@ -655,6 +655,38 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   socket invariant, and that the cell binds the socket plus the read-only host system and no
   home, then the connect-through-the-bind end-to-end. Built and tested on darwin and in the
   Linux container.
+- Phase 3 compositor multi-monitor logical layout (`compositor`, Linux): real
+  multi-monitor support, the second of the two DRM gaps (the first, a display-only
+  secondary GPU, remains). Outputs no longer mirror the one scene from the origin;
+  each is placed in one shared logical coordinate space and scans out only its own
+  region, so a window lives at a single position across the whole desktop and the
+  screens span it instead of all showing the same pixels. The testable core is two
+  pure pieces. (1) `compositor::layout` is the arrangement policy: `arrange` lays
+  outputs left to right, top-aligned, returning each one's logical position, and
+  `span` gives the cursor's bounding box; plain integers, no Wayland types, so it
+  builds and unit-tests on darwin too, not only in the container. (2)
+  `render::output_render_elements` crops and offsets the shared `Space` to one
+  output's geometry through Smithay's `render_elements_for_region`, the same
+  elements the DRM backend scans out, so the paint path now has a single-output
+  collector (the whole space from the origin, for winit and the headless
+  `render_space`) and a per-output one (one output's region), both feeding one
+  `composite` core. On the usual headless split the whole thing is proven without a
+  display: a new id-based output API (`Compositor::add_output` / `move_output` /
+  `render_output`, render-gated) places several outputs in the shared space and
+  reads each back through the software renderer, and two tests assert a window shows
+  only on the output whose region covers it (not mirrored onto the others) and that
+  moving an output shifts the region it renders, alongside 5 layout units. The DRM
+  backend now maps each lit connector into the shared space at its layout position
+  (`relayout`, recomputed on monitor or GPU hotplug, the primary GPU's outputs
+  sorted first so the primary monitor sits at the origin where new windows open),
+  renders each output's own region instead of the whole scene mirrored, and clamps
+  the cursor to the full span so the pointer crosses between screens; like the rest
+  of the backend it is compile-checked and clippy-clean under `udev` and
+  eye-verified on hardware next. The window scene is shared; the shell background is
+  still drawn per output at its own origin (each monitor shows the Glass desktop).
+  Advertising each output to clients as its own `wl_output` global, and per-output
+  scale, are the remaining multi-monitor gaps. Built and tested on darwin (layout)
+  and in the Linux container (render + udev).
 
 ## Next
 
@@ -675,9 +707,16 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   click and type into it, and run `horizon compositor drm` from a console on bare
   metal to do the same straight on the GPU. The DRM path has since been hardened
   (multi-GPU, connector and GPU hotplug, VT-switch buffer recovery), all written
-  and compile-checked on the same split, so it too is waiting on that eye part;
-  what is left on it is a display-only secondary GPU and a real multi-monitor
-  logical layout. The shell proper has started: the compositor now draws a
+  and compile-checked on the same split, so it too is waiting on that eye part. A
+  real multi-monitor logical layout is now done: each output is placed in one shared
+  coordinate space (a left-to-right `compositor::layout`) and scans out only its own
+  region instead of mirroring the whole scene, hotplug-aware, with the cursor
+  spanning all screens, proven headlessly (a pure layout plus per-output region
+  rendering, read back through the software renderer with an id-based output API) and
+  eye-verified on hardware next; what is left on the backend is the display-only
+  secondary GPU (render on one card, scan out on another, the one cross-GPU case shm
+  sidesteps), plus advertising each output to clients as its own `wl_output` global
+  and per-output scale. The shell proper has started: the compositor now draws a
   full-screen background (the Glass L5 desktop, a pure Model -> Scene -> Pixmap
   renderer in the `glass` crate) behind client windows, proven on the headless
   pixman path and wired into the winit backend, with `horizon compositor

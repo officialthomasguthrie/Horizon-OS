@@ -21,9 +21,13 @@
 //! output with no cross-GPU buffer sharing; a display-only secondary GPU (render
 //! on one card, scan out on another) is the one multi-GPU case still left.
 //!
-//! Every output mirrors the one compositor scene at its own mode; placing outputs
-//! in a shared logical space for a real multi-monitor layout is a later shell
-//! concern, not a backend one.
+//! Every output is placed in one shared logical space (a left-to-right
+//! [`layout`](crate::layout)) and scans out its own region of the scene, so a real
+//! multi-monitor desktop spans the screens instead of mirroring one onto all of
+//! them, and the cursor roams the whole span. The window scene is shared; the
+//! shell background is still drawn per output at its own origin (each monitor
+//! shows the Glass desktop). Advertising each output to clients as its own
+//! `wl_output` global, and per-output scale, are the remaining gaps.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -62,9 +66,9 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Logical, Point, Size, Transform};
 
-use crate::render::space_render_elements;
+use crate::render::output_render_elements;
 use crate::server::ShellEvent;
-use crate::{Compositor, Error, Result};
+use crate::{layout, Compositor, Error, Result};
 
 // The renderer is a GBM/GLES backend driven through Smithay's multi-GPU manager.
 // One manager holds every GPU's node, so even the single-GPU case goes through
@@ -108,9 +112,9 @@ const COLOR_FORMATS: &[Fourcc] = &[Fourcc::Argb8888, Fourcc::Xrgb8888];
 // One lit output, driven by one CRTC.
 struct OutputSurface {
     drm: DrmOut,
-    // The smithay Output the DrmCompositor reads its mode/scale/transform from,
-    // held for the surface's lifetime.
-    #[allow(dead_code)]
+    // The smithay Output the DrmCompositor reads its mode/scale/transform from.
+    // Also mapped into the compositor's shared `Space` (at its logical layout
+    // position) so this surface scans out its own region of the scene.
     output: Output,
     // True between queue_frame and the vblank that retires it: do not draw the
     // next frame on this output until the page flip completes.
@@ -156,8 +160,17 @@ struct DrmBackend {
     // The cursor position in output-logical pixels; libinput pointer motion is
     // relative, so we accumulate and clamp it ourselves.
     cursor: Point<f64, Logical>,
-    // Cursor clamp bounds: the primary output's mode size.
+    // Cursor clamp bounds: the whole multi-monitor span, so the pointer can cross
+    // from one screen to the next instead of being trapped on the first.
     output_size: Size<i32, Logical>,
+    // The outputs currently mapped into the compositor's shared space, so a
+    // relayout can drop the old arrangement before installing the new one. Kept in
+    // step with the lit surfaces across hotplug by `relayout`.
+    mapped: Vec<Output>,
+    // Set when the set of lit outputs changes (a monitor or GPU was plugged or
+    // unplugged), so the next loop iteration recomputes the layout and remaps the
+    // shared space. Cheap to leave true for a tick; relayout is a few map calls.
+    outputs_dirty: bool,
     // The shell background uploaded for scanout, drawn behind every window. Shared
     // across every GPU and output (each imports it into its own renderer context
     // lazily, only re-uploading damaged regions). None when no background is set.
@@ -223,6 +236,13 @@ pub(crate) fn run(
             comp.set_shell_background(&rgba, ow, oh);
         }
 
+        // A monitor or GPU came or went: recompute the left-to-right layout and
+        // remap the shared space before this frame, so each output scans out its
+        // own region. Cheap and skipped when nothing changed.
+        if backend.outputs_dirty {
+            backend.relayout(comp);
+        }
+
         // Service Wayland clients (accept, dispatch, flush) between frames.
         comp.dispatch(Some(Duration::ZERO))?;
 
@@ -253,30 +273,33 @@ fn render_all(comp: &mut Compositor, backend: &mut DrmBackend) {
                 continue;
             }
         };
-        // The window surfaces, then the shell background appended last so it sits
-        // behind them (render_frame draws the element list front to back).
-        let mut elements: Vec<ShellElement<UdevRenderer>> =
-            space_render_elements(&mut renderer, comp.space())
-                .into_iter()
-                .map(ShellElement::Surface)
-                .collect();
-        if let Some(buffer) = &backend.background {
-            match MemoryRenderBufferRenderElement::from_buffer(
-                &mut renderer,
-                (0.0, 0.0),
-                buffer,
-                None,
-                None,
-                None,
-                Kind::Unspecified,
-            ) {
-                Ok(element) => elements.push(ShellElement::Background(element)),
-                Err(e) => eprintln!("compositor: background upload: {e}"),
-            }
-        }
         for surface in device.surfaces.values_mut() {
             if surface.pending {
                 continue;
+            }
+            // This output's own region of the shared scene (only the windows that
+            // fall on it, offset to its logical origin), then the shell background
+            // appended last so it sits behind them (render_frame draws the element
+            // list front to back). Built per output, not once per device, so each
+            // screen shows its slice rather than the whole scene mirrored.
+            let mut elements: Vec<ShellElement<UdevRenderer>> =
+                output_render_elements(&mut renderer, comp.space(), &surface.output)
+                    .into_iter()
+                    .map(ShellElement::Surface)
+                    .collect();
+            if let Some(buffer) = &backend.background {
+                match MemoryRenderBufferRenderElement::from_buffer(
+                    &mut renderer,
+                    (0.0, 0.0),
+                    buffer,
+                    None,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ) {
+                    Ok(element) => elements.push(ShellElement::Background(element)),
+                    Err(e) => eprintln!("compositor: background upload: {e}"),
+                }
             }
             match surface
                 .drm
@@ -405,6 +428,8 @@ fn setup(loop_handle: LoopHandle<'static, DrmBackend>) -> Result<DrmBackend> {
         input_events: Vec::new(),
         cursor: Point::from((0.0, 0.0)),
         output_size: Size::from((1920, 1080)),
+        mapped: Vec::new(),
+        outputs_dirty: false,
         background: None,
         background_gen: 0,
         active: true,
@@ -582,6 +607,8 @@ impl DrmBackend {
         if self.primary_gpu == Some(node) {
             self.primary_gpu = self.devices.keys().next().copied();
         }
+        // Its outputs are gone, so the shared-space layout must be recomputed.
+        self.outputs_dirty = true;
         println!("compositor: GPU {node:?} removed");
         // device (and its outputs) drop here.
     }
@@ -598,8 +625,7 @@ impl DrmBackend {
     // display on a free CRTC, drop the output of one that was unplugged. Called
     // when the GPU comes up and whenever udev signals it changed.
     fn scan_connectors(&mut self, node: DrmNode) {
-        let is_primary = self.primary_gpu == Some(node);
-        let mut primary_size: Option<Size<i32, Logical>> = None;
+        let mut changed = false;
 
         {
             let Some(device) = self.devices.get_mut(&node) else {
@@ -676,6 +702,7 @@ impl DrmBackend {
             for conn in removed {
                 if let Some(crtc) = device.connectors.remove(&conn) {
                     device.surfaces.remove(&crtc); // drops the DrmOut, frees the CRTC
+                    changed = true;
                     println!("compositor: display on {conn:?} unplugged");
                 }
             }
@@ -701,9 +728,6 @@ impl DrmBackend {
                 ) {
                     Ok(drm) => {
                         let (w, h) = mode.size();
-                        if is_primary {
-                            primary_size = Some(Size::from((w as i32, h as i32)));
-                        }
                         device.surfaces.insert(
                             crtc,
                             OutputSurface {
@@ -713,6 +737,7 @@ impl DrmBackend {
                             },
                         );
                         device.connectors.insert(conn, crtc);
+                        changed = true;
                         println!("compositor: display on {conn:?} lit at {w}x{h}");
                     }
                     Err(e) => eprintln!("compositor: initialize output: {e}"),
@@ -720,9 +745,56 @@ impl DrmBackend {
             }
         }
 
-        if let Some(size) = primary_size {
-            self.output_size = size;
+        // The lit set changed, so the shared-space layout needs recomputing on the
+        // next loop iteration (where the compositor is in hand to map into).
+        self.outputs_dirty |= changed;
+    }
+
+    // Recompute the left-to-right layout over every lit output and resync the
+    // compositor's shared space to it: drop the old mapping, place each output at
+    // its new logical position, and clamp the cursor to the whole span. Called from
+    // the run loop (which holds the compositor) whenever the lit set changed.
+    fn relayout(&mut self, comp: &mut Compositor) {
+        // Gather every lit output across all GPUs in a stable order: the primary
+        // GPU's outputs first (so the primary monitor sits at the origin, where new
+        // windows open), then by connector name, so the arrangement is
+        // deterministic across hotplug.
+        let mut entries: Vec<(bool, String, Output)> = self
+            .devices
+            .iter()
+            .flat_map(|(node, device)| {
+                let primary = self.primary_gpu == Some(*node);
+                device
+                    .surfaces
+                    .values()
+                    .map(move |s| (primary, s.output.name(), s.output.clone()))
+            })
+            .collect();
+        entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let outputs: Vec<Output> = entries.into_iter().map(|(_, _, output)| output).collect();
+        let sizes: Vec<(i32, i32)> = outputs
+            .iter()
+            .map(|o| {
+                o.current_mode()
+                    .map(|m| (m.size.w, m.size.h))
+                    .unwrap_or((0, 0))
+            })
+            .collect();
+        let positions = layout::arrange(&sizes);
+
+        // Drop the previous arrangement, then install the new one.
+        for old in self.mapped.drain(..) {
+            comp.unmap_output(&old);
         }
+        for (output, &(x, y)) in outputs.iter().zip(positions.iter()) {
+            comp.map_output(output, x, y);
+            self.mapped.push(output.clone());
+        }
+
+        // The cursor roams the whole desktop; never let the clamp box collapse.
+        let (w, h) = layout::span(&sizes);
+        self.output_size = Size::from((w.max(1), h.max(1)));
+        self.outputs_dirty = false;
     }
 }
 

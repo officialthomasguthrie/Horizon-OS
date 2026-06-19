@@ -2,16 +2,22 @@
 //!
 //! This is the step that turns client buffers into pixels, kept on the same
 //! split as the rest of the compositor: the part that can be proven without a
-//! display is built and tested headlessly. [`paint_space`] imports each mapped
-//! surface's buffer and composites the `Space` into a bound framebuffer; it is
-//! generic over the renderer, so the same code paints the offscreen pixman
-//! buffer asserted on in the headless test and the on-screen GLES window the
-//! winit backend presents. Only the render target differs.
+//! display is built and tested headlessly. [`composite`] is the core that imports
+//! the scene's buffers and draws them (with the shell background behind) into a
+//! bound framebuffer; it is generic over the renderer, so the same code paints the
+//! offscreen pixman buffer asserted on in the headless tests and the on-screen
+//! GLES window the winit backend presents ([`paint_space`]). Only the render
+//! target differs.
 //!
-//! [`render_space`] is the headless path: paint into an offscreen pixman buffer
-//! (pure software, no GPU) and read the pixels back. Pixels come back as
-//! `Argb8888` (the DRM fourcc): little-endian, four bytes per pixel, so a 32-bit
-//! word reads `0xAARRGGBB`. [`RenderedFrame::argb`] decodes one pixel that way.
+//! Which windows it draws depends on the element collector the caller picks: the
+//! whole space from the global origin ([`space_render_elements`], the single-output
+//! winit and [`render_space`] paths) or one output's own region of the shared
+//! logical space ([`output_render_elements`], the multi-monitor [`render_output`]
+//! path and the DRM scanout). [`render_space`] and [`render_output`] are the
+//! headless readbacks: paint into an offscreen pixman buffer (pure software, no
+//! GPU) and read the pixels back. Pixels come back as `Argb8888` (the DRM fourcc):
+//! little-endian, four bytes per pixel, so a 32-bit word reads `0xAARRGGBB`.
+//! [`RenderedFrame::argb`] decodes one pixel that way.
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::surface::{
@@ -20,7 +26,7 @@ use smithay::backend::renderer::element::surface::{
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::utils::draw_render_elements;
 use smithay::backend::renderer::{
-    Bind, Color32F, ExportMem, Frame, ImportAll, ImportMem, Offscreen, Renderer,
+    Bind, Color32F, ExportMem, Frame, ImportAll, ImportMem, Offscreen, Renderer, Texture,
 };
 use smithay::desktop::{Space, Window};
 use smithay::output::Output;
@@ -93,13 +99,14 @@ impl RenderedFrame {
     }
 }
 
-// Build the scene's render elements: one surface tree per mapped toplevel, placed
-// at its location in the Space, in front-to-back order. Generic over the renderer
-// so every paint path shares it, the offscreen pixman buffer ([`paint_space`]),
-// the on-screen GLES window (also `paint_space`), and the DRM/KMS scanout (which
-// hands these straight to `DrmOutput::render_frame`). They all draw the same
-// scene; only the render target differs. The elements own their textures
-// (`TextureId: Clone + 'static`), so the renderer borrow is released on return.
+// Build the whole scene's render elements: one surface tree per mapped toplevel,
+// placed at its location in the Space, in front-to-back order, all from the global
+// origin. This is the single-output collector: the winit nested window (via
+// [`paint_space`]) and the headless [`render_space`] readback, where the one output
+// sits at the origin. Multi-monitor paths use [`output_render_elements`] to take
+// just one output's region instead. Generic over the renderer so each path shares
+// it; the elements own their textures (`TextureId: Clone + 'static`), so the
+// renderer borrow is released on return.
 pub(crate) fn space_render_elements<R>(
     renderer: &mut R,
     space: &Space<Window>,
@@ -126,17 +133,46 @@ where
     elements
 }
 
-// Import every mapped surface's buffer and composite the scene into the bound
-// framebuffer: clear to `clear`, then draw each window at its scene location.
+// The scene's render elements for one output's region of the shared logical
+// space: only the windows that fall on this output, each offset so the output's
+// logical origin maps to the framebuffer origin. This is what makes a real
+// multi-monitor layout: every output paints its own slice instead of mirroring
+// the whole scene from the global origin. The output must be mapped into the
+// `Space` (so it has a geometry); an unmapped one yields nothing. Smithay's
+// `render_elements_for_region` does the cropping and offset, so both the headless
+// per-output readback ([`render_output`]) and the DRM scanout share it, the same
+// way [`space_render_elements`] is shared by the single-output paths.
+pub(crate) fn output_render_elements<R>(
+    renderer: &mut R,
+    space: &Space<Window>,
+    output: &Output,
+) -> Vec<WaylandSurfaceRenderElement<R>>
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + Texture + 'static,
+{
+    match space.output_geometry(output) {
+        Some(geo) => {
+            let scale = output.current_scale().fractional_scale();
+            space.render_elements_for_region(renderer, &geo, scale, 1.0)
+        }
+        None => Vec::new(),
+    }
+}
+
+// Composite a precomputed element list into the bound framebuffer: clear to
+// `clear`, draw the shell background behind everything, then the windows over it.
 // Generic over the renderer so the headless (pixman) and on-screen (GLES) paths
-// run the same compositing. `transform` is the output transform the backend
-// needs (none for a top-left offscreen buffer, a flip for a GL window). The
-// DRM/KMS backend does not call this: its `DrmOutput` clears and draws the
-// elements from [`space_render_elements`] itself.
-pub(crate) fn paint_space<'buffer, R>(
+// run the same compositing. `transform` is the output transform the backend needs
+// (none for a top-left offscreen buffer, a flip for a GL window). The elements are
+// passed in so the caller chooses the scene: the whole space from the origin
+// ([`space_render_elements`], the single-output paths) or one output's region
+// ([`output_render_elements`], multi-monitor). The DRM/KMS backend does not call
+// this: its `DrmOutput` clears and draws its own element list.
+fn composite<'buffer, R>(
     renderer: &mut R,
     framebuffer: &mut R::Framebuffer<'buffer>,
-    space: &Space<Window>,
+    elements: &[WaylandSurfaceRenderElement<R>],
     size: Size<i32, Physical>,
     transform: Transform,
     clear: Color32F,
@@ -146,7 +182,6 @@ where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Clone + 'static,
 {
-    let elements = space_render_elements(renderer, space);
     // Upload the background image to a texture before the frame borrows the
     // renderer. The window elements draw over it.
     let bg = match background {
@@ -187,7 +222,7 @@ where
             )
             .map_err(|e| Error::Render(e.to_string()))?;
     }
-    draw_render_elements(&mut frame, 1.0, &elements, &[full])
+    draw_render_elements(&mut frame, 1.0, elements, &[full])
         .map_err(|e| Error::Render(e.to_string()))?;
     // The returned sync point is awaited by the caller's present (winit) or is
     // already signalled for synchronous software rendering (pixman).
@@ -195,37 +230,73 @@ where
     Ok(())
 }
 
-// Composite the current scene into an offscreen Argb8888 buffer the size of the
-// output, then read it back. A fresh renderer per call keeps this self-contained
-// (the buffer import is a memcpy, cheap enough for the offscreen path); the
-// on-screen backend holds its renderer across frames instead.
-pub(crate) fn render_space(
+// Composite the whole space (every window from the global origin) into the bound
+// framebuffer, for the winit nested window: it presents one output (the default,
+// at the origin), so the whole scene and its region coincide. The headless
+// readback and the DRM scanout pick their elements per output instead.
+#[cfg(feature = "winit")]
+pub(crate) fn paint_space<'buffer, R>(
+    renderer: &mut R,
+    framebuffer: &mut R::Framebuffer<'buffer>,
     space: &Space<Window>,
-    output: &Output,
+    size: Size<i32, Physical>,
+    transform: Transform,
+    clear: Color32F,
     background: Option<&ShellBackground>,
-) -> Result<RenderedFrame> {
+) -> Result<()>
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + 'static,
+{
+    let elements = space_render_elements(renderer, space);
+    composite(
+        renderer,
+        framebuffer,
+        &elements,
+        size,
+        transform,
+        clear,
+        background,
+    )
+}
+
+// Composite an offscreen Argb8888 buffer of `size` and read it back, the headless
+// software path. A fresh pixman renderer per call keeps this self-contained (the
+// buffer import is a memcpy, cheap enough for the offscreen path); the on-screen
+// backend holds its renderer across frames instead. The caller supplies the scene
+// as a closure over the renderer, so the same readback serves the whole-space and
+// per-output element collectors. Pixels come back top-left origin (no GL flip), so
+// a readback pixel maps straight to its scene coordinate.
+fn read_back<F>(
+    size: Size<i32, Physical>,
+    background: Option<&ShellBackground>,
+    scene: F,
+) -> Result<RenderedFrame>
+where
+    F: FnOnce(
+        &mut smithay::backend::renderer::pixman::PixmanRenderer,
+    ) -> Vec<
+        WaylandSurfaceRenderElement<smithay::backend::renderer::pixman::PixmanRenderer>,
+    >,
+{
     use smithay::backend::renderer::pixman::PixmanRenderer;
 
-    let mode = output
-        .current_mode()
-        .ok_or_else(|| Error::Render("output has no mode".into()))?;
-    let size = mode.size; // physical pixels
-
     let mut renderer = PixmanRenderer::new().map_err(|e| Error::Render(e.to_string()))?;
+    // The elements own their textures, so building them here releases the
+    // renderer borrow before the frame binds it.
+    let elements = scene(&mut renderer);
+
     let buffer_size = Size::<i32, BufferCoords>::from((size.w, size.h));
     let mut target = renderer
         .create_buffer(Fourcc::Argb8888, buffer_size)
         .map_err(|e| Error::Render(e.to_string()))?;
-
     let mut framebuffer = renderer
         .bind(&mut target)
         .map_err(|e| Error::Render(e.to_string()))?;
-    // Top-left origin (no GL flip), so a readback pixel maps straight to its
-    // scene coordinate. Clear to opaque black, then draw the windows over it.
-    paint_space(
+    composite(
         &mut renderer,
         &mut framebuffer,
-        space,
+        &elements,
         size,
         Transform::Normal,
         Color32F::new(0.0, 0.0, 0.0, 1.0),
@@ -244,5 +315,42 @@ pub(crate) fn render_space(
         width: size.w as u32,
         height: size.h as u32,
         pixels: bytes.to_vec(),
+    })
+}
+
+// The physical pixel size of an output's current mode, or an error if it has none.
+fn output_size(output: &Output) -> Result<Size<i32, Physical>> {
+    output
+        .current_mode()
+        .map(|m| m.size)
+        .ok_or_else(|| Error::Render("output has no mode".into()))
+}
+
+// Composite the whole space into an offscreen buffer the size of the output and
+// read it back: the headless single-output path behind `Compositor::render`.
+pub(crate) fn render_space(
+    space: &Space<Window>,
+    output: &Output,
+    background: Option<&ShellBackground>,
+) -> Result<RenderedFrame> {
+    read_back(output_size(output)?, background, |renderer| {
+        space_render_elements(renderer, space)
+    })
+}
+
+// Composite one output's own region of the shared space into an offscreen buffer
+// the size of that output's mode and read it back: the headless multi-monitor
+// path behind `Compositor::render_output`. The output must be mapped into the
+// space; an unmapped one renders an empty (cleared) frame. This exercises the
+// exact `output_render_elements` the DRM backend scans out, so per-output region
+// rendering is proven without a display, the same split the rest of the
+// compositor uses.
+pub(crate) fn render_output(
+    space: &Space<Window>,
+    output: &Output,
+    background: Option<&ShellBackground>,
+) -> Result<RenderedFrame> {
+    read_back(output_size(output)?, background, |renderer| {
+        output_render_elements(renderer, space, output)
     })
 }

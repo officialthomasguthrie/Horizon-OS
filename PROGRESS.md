@@ -566,6 +566,32 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   at the output origin, so on a larger monitor it sits top-left, the same single-scene
   limitation the rest of the DRM backend has. Built and compile-checked from the Linux
   container on this display-less darwin host.
+- Phase 3 Glass shell live refresh (`weave` + `compositor` + `horizon`): the drawn Glass
+  desktop now reflects changes made to the store from OUTSIDE the shell, not only an
+  in-shell sever click. The honest problem was that the shell holds one in-memory broker
+  opened once, so it never saw appends another process (a `horizon weave grant`, a cell
+  reaching a resource, an external `glass sever`) made to the same audit log. The core is
+  `Broker::reload`: it re-reads the one audit ref and, only if the head changed since the
+  broker last looked, re-replays the chain to rebuild the live grant table, returning
+  whether anything changed. It is cheap on an idle store (a single small ref read, no
+  chain walk, no grant touched) because every Lifestream read already goes to disk, so a
+  long-lived broker folds in out-of-band writes just by re-reading; the replay shares one
+  fold with `open`, so a reloaded grant carries no session secret exactly as a reopened
+  one does. The compositor offers the shell owner a periodic `Tick` alongside the existing
+  background `Click`, unified into one `ShellEvent` closure both `show` and `run_drm` take
+  (one closure, not two, because the owner holds the shell behind a single mutable borrow);
+  each loop iteration offers a tick and uploads any returned redraw. The horizon `Shell`
+  owns the cadence: `refresh` rate-limits to a 500ms poll, calls `Broker::reload`, and
+  relayouts and redraws only when it reports a change, so an idle desktop re-uploads
+  nothing and a live one keeps its clickable scene in sync with the store. On the usual
+  split, the testable core is proven headlessly on darwin and Linux: a weave test that
+  `reload` picks up a second broker's grant and revoke and is idempotent, and a glass test
+  that the Model is stale until the broker reloads and then reflects an external grant
+  (open a store, append externally, re-summarize, assert the model changed); the winit/drm
+  tick wiring is compile-checked and clippy-clean under the features and eye-verified on a
+  screen later, the same bar as the rest of the backend. `horizon compositor show
+  --background` and `drm --background` now say the desktop refreshes live. Built and
+  compile-checked from the Linux container on this display-less darwin host.
 
 ## Next
 
@@ -599,11 +625,12 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   --background`, and now on the bare-metal DRM backend too: the background is painted
   as a `MemoryRenderBufferRenderElement` behind the windows (the Send-able multi-GPU
   texture path the element-list present loop needs) and the sever click runs through
-  the same `on_shell_click` closure, behind `horizon compositor drm --background`.
-  What is left on the shell: refreshing the background live as the audit log changes
-  from outside, and the Aura intent line becoming a real launcher/command palette.
-  Confined cells can already host compositor surfaces (the cells exec path is ready).
-  Linux-only.
+  the same shell closure, behind `horizon compositor drm --background`. The desktop now
+  also refreshes live as the audit log changes from outside (the compositor offers a
+  periodic `Tick` through the same `ShellEvent` closure as the click, and the shell polls
+  `Broker::reload` and redraws only on a change), proven headlessly. What is left on the
+  shell: the Aura intent line becoming a real launcher/command palette. Confined cells can
+  already host compositor surfaces (the cells exec path is ready). Linux-only.
 - Glass: the live transparency surface over the weave audit log. The model layer
   and the drawn surface are both done (the `glass` crate: a pure fold of the
   broker's grant table and audit log into a per-principal map of
@@ -620,9 +647,11 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   through `Scene::action_at` and severs, then redraws), behind `horizon compositor
   show --background`, and on the bare-metal DRM backend behind `horizon compositor
   drm --background` (the background drawn as a `MemoryRenderBufferRenderElement`, the
-  click routed the same way). What is left: refreshing it live as the log changes
-  from outside. Eye-verify on a screen; a confined cell can host it (the cells exec
-  path is ready).
+  click routed the same way). It also refreshes live now as the log changes from
+  outside the shell: `Broker::reload` re-reads the audit log only when its head moved,
+  and the compositor offers the shell a periodic `Tick` (the same `ShellEvent` closure
+  as the click) so the desktop redraws when another process grants, uses, or revokes.
+  Eye-verify on a screen; a confined cell can host it (the cells exec path is ready).
 - Phase 5 Constellation real-host verification: the whole networking stack that
   can be built and tested on one host is done and in CI, the QUIC + Noise
   transport, serve/sync CLI, concurrent multi-peer serving, mDNS LAN discovery,

@@ -63,6 +63,7 @@ use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Logical, Point, Size, Transform};
 
 use crate::render::space_render_elements;
+use crate::server::ShellEvent;
 use crate::{Compositor, Error, Result};
 
 // The renderer is a GBM/GLES backend driven through Smithay's multi-GPU manager.
@@ -173,7 +174,7 @@ struct DrmBackend {
 /// as in the headless core; their windows are then scanned out to every screen.
 pub(crate) fn run(
     comp: &mut Compositor,
-    mut on_shell_click: impl FnMut(i32, i32) -> Option<Vec<u8>>,
+    mut on_shell: impl FnMut(ShellEvent) -> Option<Vec<u8>>,
 ) -> Result<()> {
     let mut event_loop: EventLoop<'static, DrmBackend> =
         EventLoop::try_new().map_err(|e| Error::Init(format!("event loop: {e}")))?;
@@ -198,10 +199,19 @@ pub(crate) fn run(
         // the owner; if it redraws the surface (e.g. a Glass `sever` button was
         // clicked), set the new background, which the next frame uploads.
         if let Some((x, y)) = comp.take_shell_click() {
-            if let Some(rgba) = on_shell_click(x, y) {
+            if let Some(rgba) = on_shell(ShellEvent::Click(x, y)) {
                 let (ow, oh) = comp.output_size();
                 comp.set_shell_background(&rgba, ow, oh);
             }
+        }
+
+        // Offer a tick so the owner can poll for changes made outside the shell
+        // (e.g. the audit log grew) and refresh the background; the next frame
+        // uploads it. The owner rate-limits this, so an idle desktop pays only a
+        // cheap check per iteration and re-uploads nothing.
+        if let Some(rgba) = on_shell(ShellEvent::Tick) {
+            let (ow, oh) = comp.output_size();
+            comp.set_shell_background(&rgba, ow, oh);
         }
 
         // Service Wayland clients (accept, dispatch, flush) between frames.

@@ -1017,7 +1017,8 @@ fn compositor_show(background: Option<&Path>, days: u64) -> Result<()> {
             let (shell, rgba) = Shell::open(store, days, ow as u32, oh as u32)?;
             comp.set_shell_background(&rgba, ow, oh);
             println!(
-                "compositor: Glass shell background from {} (click `sever` to revoke a capability)",
+                "compositor: Glass shell background from {} (click `sever` to revoke a \
+                 capability; refreshes live as the audit log changes)",
                 store.display()
             );
             Some(shell)
@@ -1028,18 +1029,34 @@ fn compositor_show(background: Option<&Path>, days: u64) -> Result<()> {
     println!("compositor: close the window to stop");
     io::stdout().flush().ok();
 
-    comp.show(|x, y| {
-        shell
-            .as_mut()
-            .and_then(|s| s.click(x, y, ow as u32, oh as u32))
+    comp.show(|event| {
+        let s = shell.as_mut()?;
+        match event {
+            compositor::ShellEvent::Click(x, y) => s.click(x, y, ow as u32, oh as u32),
+            compositor::ShellEvent::Tick => s.refresh(ow as u32, oh as u32),
+        }
     })
     .context("run winit backend")
 }
 
+// How often the live shell polls the store for changes made outside it (another
+// process granting, using, or revoking a capability). Human-scale, so half a
+// second reads as immediate while the per-frame cost stays a clock check; an
+// actual store read happens at most this often, and re-uploads the surface only
+// when the audit log actually changed.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "compositor-winit", feature = "compositor-udev")
+))]
+const SHELL_POLL: Duration = Duration::from_millis(500);
+
 // The interactive Glass shell behind an on-screen backend. It holds the broker,
 // the window it summarizes, and the last scene it drew, so a pointer click can be
 // resolved against the scene's hit targets, applied through Glass, and the surface
-// redrawn. Shared by the winit (`show`) and bare-metal (`drm`) backends.
+// redrawn. It also refreshes on a periodic tick (`refresh`): the broker is opened
+// once and would not otherwise see appends another process makes to the store, so
+// each poll re-reads the audit log and redraws when it changed. Shared by the
+// winit (`show`) and bare-metal (`drm`) backends.
 #[cfg(all(
     target_os = "linux",
     any(feature = "compositor-winit", feature = "compositor-udev")
@@ -1048,6 +1065,9 @@ struct Shell {
     broker: Broker,
     window: glass::Window,
     scene: glass::Scene,
+    // When the store was last polled, so the render loop's per-frame Tick costs a
+    // clock check until SHELL_POLL elapses.
+    last_poll: std::time::Instant,
 }
 
 #[cfg(all(
@@ -1068,6 +1088,7 @@ impl Shell {
                 broker,
                 window,
                 scene,
+                last_poll: std::time::Instant::now(),
             },
             rgba,
         ))
@@ -1106,6 +1127,35 @@ impl Shell {
         self.scene = glass::layout(&model, width, height, 2);
         Ok(glass::raster::rasterize(&self.scene).rgba)
     }
+
+    // A periodic tick from the render loop. The Shell holds one broker opened
+    // once, so it does not see appends another process makes to the store; this
+    // re-reads the audit log and, only if it changed, relayouts the surface and
+    // returns the new RGBA to redraw, so the live desktop reflects a grant, use,
+    // or revoke made from outside (e.g. a `horizon weave grant` in another shell).
+    // Rate-limited to SHELL_POLL so a 60fps loop does not stat the store every
+    // frame; cheap when nothing changed (`Broker::reload` reads only the audit ref
+    // and walks no chain, so there is no relayout and no re-upload).
+    fn refresh(&mut self, width: u32, height: u32) -> Option<Vec<u8>> {
+        if self.last_poll.elapsed() < SHELL_POLL {
+            return None;
+        }
+        self.last_poll = std::time::Instant::now();
+        match self.broker.reload() {
+            Ok(false) => None,
+            Ok(true) => match self.rerender(width, height) {
+                Ok(rgba) => Some(rgba),
+                Err(e) => {
+                    eprintln!("compositor: redraw failed: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("compositor: store reload failed: {e}");
+                None
+            }
+        }
+    }
 }
 
 // Run the bare-metal DRM/KMS backend: drive a real display directly off the GPU
@@ -1139,7 +1189,8 @@ fn compositor_drm(background: Option<&Path>, days: u64) -> Result<()> {
             let (shell, rgba) = Shell::open(store, days, ow as u32, oh as u32)?;
             comp.set_shell_background(&rgba, ow, oh);
             println!(
-                "compositor: Glass shell background from {} (click `sever` to revoke a capability)",
+                "compositor: Glass shell background from {} (click `sever` to revoke a \
+                 capability; refreshes live as the audit log changes)",
                 store.display()
             );
             Some(shell)
@@ -1150,10 +1201,12 @@ fn compositor_drm(background: Option<&Path>, days: u64) -> Result<()> {
     println!("compositor: switch VT or kill the process to stop");
     io::stdout().flush().ok();
 
-    comp.run_drm(|x, y| {
-        shell
-            .as_mut()
-            .and_then(|s| s.click(x, y, ow as u32, oh as u32))
+    comp.run_drm(|event| {
+        let s = shell.as_mut()?;
+        match event {
+            compositor::ShellEvent::Click(x, y) => s.click(x, y, ow as u32, oh as u32),
+            compositor::ShellEvent::Tick => s.refresh(ow as u32, oh as u32),
+        }
     })
     .context("run drm backend")
 }

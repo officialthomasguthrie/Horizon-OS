@@ -53,6 +53,8 @@ pub use error::{Error, Result};
 mod server;
 #[cfg(target_os = "linux")]
 pub use server::Compositor;
+#[cfg(all(target_os = "linux", any(feature = "winit", feature = "udev")))]
+pub use server::ShellEvent;
 
 // Offscreen software compositing (the `render` feature) and the on-screen winit
 // backend (the `winit` feature, which builds on it) live behind features so the

@@ -85,8 +85,50 @@ impl Broker {
     // replaying the audit log. The log is the source of truth; this is a fold.
     pub fn open(ls: Lifestream, policy: Policy) -> Result<Broker> {
         let head = ls.get_ref(AUDIT_REF)?;
+        let (grants, seq) = Self::replay(&ls, head)?;
+        Ok(Broker {
+            ls,
+            policy,
+            head,
+            seq,
+            grants,
+        })
+    }
+
+    // Re-read the audit log and, if it changed since this broker last looked,
+    // rebuild the live grant table from it. Returns true when the state changed.
+    // This is how a long-lived broker (the Glass shell holds one open) picks up
+    // grants, uses, and revocations another process appended to the same store:
+    // the log is the source of truth and every store read goes to disk, so
+    // re-reading the head and replaying folds in whatever was written out of band.
+    // Cheap when nothing changed: it reads only the one audit ref and compares it
+    // to the head already held, walking no chain and touching no grant, so a poll
+    // on an idle store costs a single small file read. Like reopening, a replayed
+    // grant carries no session secret (see GrantState); a holder of a live handle
+    // reissue()s after a reload that rebuilt its grant.
+    pub fn reload(&mut self) -> Result<bool> {
+        let head = self.ls.get_ref(AUDIT_REF)?;
+        if head == self.head {
+            return Ok(false);
+        }
+        let (grants, seq) = Self::replay(&self.ls, head)?;
+        self.grants = grants;
+        self.head = head;
+        self.seq = seq;
+        Ok(true)
+    }
+
+    // Fold the audit chain at `head` into a fresh grant table and entry count, the
+    // shared core of open and reload. The log is authoritative, so this is a pure
+    // replay: a replayed grant has no live secret (None), because the secret lives
+    // only in the Capability the original grant minted and a returning holder
+    // reissue()s for a fresh one.
+    fn replay(
+        ls: &Lifestream,
+        head: Option<lifestream::ObjectId>,
+    ) -> Result<(HashMap<GrantId, GrantState>, u64)> {
         let entries = match head {
-            Some(h) => audit::read_chain(&ls, h)?,
+            Some(h) => audit::read_chain(ls, h)?,
             None => Vec::new(),
         };
         let mut grants: HashMap<GrantId, GrantState> = HashMap::new();
@@ -131,13 +173,7 @@ impl Broker {
                 Event::Deny { .. } => {}
             }
         }
-        Ok(Broker {
-            ls,
-            policy,
-            head,
-            seq: entries.len() as u64,
-            grants,
-        })
+        Ok((grants, entries.len() as u64))
     }
 
     // Issue a capability directly. This is the user-approved path: the broker

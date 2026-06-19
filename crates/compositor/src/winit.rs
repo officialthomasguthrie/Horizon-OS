@@ -27,6 +27,7 @@ use smithay::reexports::winit::platform::pump_events::PumpStatus;
 use smithay::utils::{Logical, Rectangle, Size, Transform};
 
 use crate::render::paint_space;
+use crate::server::ShellEvent;
 use crate::{Compositor, Error, Result};
 
 /// Open a nested window and run the compositor's render loop on it until the
@@ -35,7 +36,7 @@ use crate::{Compositor, Error, Result};
 /// then painted into this window.
 pub(crate) fn run(
     comp: &mut Compositor,
-    mut on_shell_click: impl FnMut(i32, i32) -> Option<Vec<u8>>,
+    mut on_shell: impl FnMut(ShellEvent) -> Option<Vec<u8>>,
 ) -> Result<()> {
     let (mut backend, mut winit) =
         winit::init::<GlesRenderer>().map_err(|e| Error::Render(format!("winit init: {e}")))?;
@@ -71,9 +72,16 @@ pub(crate) fn run(
         // the owner; if it redraws the surface (e.g. a Glass `sever` button was
         // clicked), upload the new background for this frame.
         if let Some((x, y)) = comp.take_shell_click() {
-            if let Some(rgba) = on_shell_click(x, y) {
+            if let Some(rgba) = on_shell(ShellEvent::Click(x, y)) {
                 comp.set_shell_background(&rgba, ow, oh);
             }
+        }
+
+        // Offer a tick so the owner can poll for changes made outside the shell
+        // (e.g. the audit log grew) and refresh the background. The owner rate-
+        // limits this, so most ticks return None and cost only a cheap check.
+        if let Some(rgba) = on_shell(ShellEvent::Tick) {
+            comp.set_shell_background(&rgba, ow, oh);
         }
 
         // Service Wayland clients (accept, dispatch, flush) between frames.

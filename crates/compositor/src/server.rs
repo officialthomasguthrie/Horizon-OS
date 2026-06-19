@@ -40,6 +40,24 @@ use smithay::{
 
 use crate::{Error, Result};
 
+/// What an on-screen backend is asking the shell owner to handle. Both arms may
+/// return new full-screen RGBA (output-sized, the bytes `glass::Pixmap` yields)
+/// to redraw the background, or `None` to leave it unchanged. This is the one
+/// callback [`Compositor::show`] and [`Compositor::run_drm`] take, so the owner
+/// holds the shell across clicks and ticks behind a single mutable borrow.
+#[cfg(any(feature = "winit", feature = "udev"))]
+pub enum ShellEvent {
+    /// A pointer press landed on the shell background at this output-logical
+    /// position (no client window was over it), e.g. a click on a Glass `sever`
+    /// button.
+    Click(i32, i32),
+    /// A periodic tick, offered each loop iteration, so the owner can poll for
+    /// changes made from outside (the audit log grew because another process
+    /// granted, used, or revoked a capability) and refresh a live desktop without
+    /// a click. The owner sets its own poll cadence; returning `None` is cheap.
+    Tick,
+}
+
 // Everything the protocol handlers touch. The `Compositor` keeps this next to
 // the `Display` so dispatch can hand it to both calloop and the Wayland core.
 struct State {
@@ -629,16 +647,18 @@ impl Compositor {
     /// driving the Wayland server between frames. Needs a real Wayland or X
     /// session to nest in (and a GPU); this is the eye-verified, on-screen path.
     ///
-    /// `on_shell_click` is called with the output-logical position of each pointer
-    /// press that lands on the shell background (no client window over it).
-    /// Returning new full-screen RGBA (output-sized, the bytes `glass::Pixmap`
-    /// produces) redraws the background; that is how a click on a Glass `sever`
-    /// button severs the capability and refreshes the desktop. Return `None` to
-    /// leave the background unchanged, or pass a closure that always returns `None`
-    /// when there is no interactive shell.
+    /// `on_shell` handles both shell interactions through one [`ShellEvent`]:
+    /// a [`Click`](ShellEvent::Click) reports a pointer press on the background
+    /// (no client window over it), the path a Glass `sever` button takes, and a
+    /// [`Tick`](ShellEvent::Tick) is offered each iteration so the owner can poll
+    /// for outside changes. Returning new full-screen RGBA (output-sized, the
+    /// bytes `glass::Pixmap` produces) redraws the background; `None` leaves it.
+    /// Pass a closure that always returns `None` when there is no interactive
+    /// shell. One closure, not two, so the owner holds the shell behind a single
+    /// mutable borrow.
     #[cfg(feature = "winit")]
-    pub fn show(&mut self, on_shell_click: impl FnMut(i32, i32) -> Option<Vec<u8>>) -> Result<()> {
-        crate::winit::run(self, on_shell_click)
+    pub fn show(&mut self, on_shell: impl FnMut(ShellEvent) -> Option<Vec<u8>>) -> Result<()> {
+        crate::winit::run(self, on_shell)
     }
 
     /// Drive a real display directly off the GPU (DRM/KMS) with libinput input,
@@ -647,16 +667,14 @@ impl Compositor {
     /// seat and a GPU, so it runs on a console (not nested), and is eye-verified
     /// on hardware.
     ///
-    /// `on_shell_click` works exactly as in [`show`](Compositor::show): each pointer
-    /// press that lands on the shell background (no client window over it) is offered
-    /// to it, and returning new full-screen RGBA redraws the background, the path a
-    /// click on a Glass `sever` button takes. Pass a closure that always returns
-    /// `None` when there is no interactive shell.
+    /// `on_shell` works exactly as in [`show`](Compositor::show): one closure
+    /// over a [`ShellEvent`], a [`Click`](ShellEvent::Click) for a press on the
+    /// background (the Glass `sever` path) and a [`Tick`](ShellEvent::Tick) each
+    /// iteration to poll for outside changes, returning new full-screen RGBA to
+    /// redraw the background or `None` to leave it. Pass a closure that always
+    /// returns `None` when there is no interactive shell.
     #[cfg(feature = "udev")]
-    pub fn run_drm(
-        &mut self,
-        on_shell_click: impl FnMut(i32, i32) -> Option<Vec<u8>>,
-    ) -> Result<()> {
-        crate::drm::run(self, on_shell_click)
+    pub fn run_drm(&mut self, on_shell: impl FnMut(ShellEvent) -> Option<Vec<u8>>) -> Result<()> {
+        crate::drm::run(self, on_shell)
     }
 }

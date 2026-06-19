@@ -293,3 +293,45 @@ fn gc_by_refs_preserves_the_audit_chain() {
     let b = Broker::open(ls, Policy::DenyAll).unwrap();
     assert_eq!(b.verify().unwrap(), n);
 }
+
+// A broker holds one open store, so it does not see another process's appends
+// until it reloads. reload() re-reads the audit log: it folds in a grant and a
+// revoke made through a second broker on the same store, is idempotent when
+// nothing changed, and reports the right status for what it picked up. This is
+// what lets the live Glass shell reflect changes made from outside it.
+#[test]
+fn reload_picks_up_external_appends() {
+    let d = store();
+    let mut a = init(d.path(), Policy::DenyAll);
+    let mut b = reopen(d.path(), Policy::DenyAll); // a second "process" on the same store
+
+    // A starts empty, and a reload with nothing new is a cheap no-op.
+    assert!(a.grants().is_empty());
+    assert!(!a.reload().unwrap());
+
+    // B grants a capability, appending to the shared log; A does not see it yet.
+    b.grant(
+        "mail".into(),
+        Resource::net("api.mail.example", 443),
+        Rights::READ | Rights::WRITE,
+        Limits::none(),
+    )
+    .unwrap();
+    assert!(a.grants().is_empty());
+
+    // A reload folds B's grant in; a second reload finds nothing new.
+    assert!(a.reload().unwrap());
+    let grants = a.grants();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].status, Status::Active);
+    let gid = grants[0].id;
+    assert!(!a.reload().unwrap());
+
+    // B revokes it; A picks the revocation up on the next reload.
+    b.revoke(gid).unwrap();
+    assert!(a.reload().unwrap());
+    assert_eq!(a.grants()[0].status, Status::Revoked);
+
+    // The replayed log is still contiguous and verifiable (grant then revoke).
+    assert_eq!(a.verify().unwrap(), 2);
+}

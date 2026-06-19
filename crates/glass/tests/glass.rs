@@ -181,3 +181,57 @@ fn a_click_on_the_sever_button_severs_the_channel() {
     assert_eq!(mail.channels[0].status, ChannelStatus::Severed);
     assert!(!mail.channels[0].can_sever());
 }
+
+// A long-lived Glass holds one broker open, so its model does not reflect appends
+// another process makes to the store until the broker reloads. Open a store,
+// append through a second broker, and confirm the model only changes after the
+// reload: open a store, append externally, re-summarize, assert the model
+// changed. This is what the live shell does on each tick.
+#[test]
+fn model_reflects_external_appends_after_reload() {
+    let d = tempdir().unwrap();
+    let mut a = Broker::open(Lifestream::init(d.path(), &KEY).unwrap(), Policy::DenyAll).unwrap();
+
+    let win = Window::week(now());
+    let before = Glass::new(&mut a)
+        .model_within(win, glass::DEFAULT_BUCKETS)
+        .unwrap();
+    assert!(before.is_empty());
+
+    // Another process grants and uses a network capability on the same store.
+    {
+        let mut b =
+            Broker::open(Lifestream::open(d.path(), &KEY).unwrap(), Policy::DenyAll).unwrap();
+        let cap = b
+            .grant(
+                "mail".into(),
+                Resource::net("api.mail.example", 443),
+                Rights::READ | Rights::WRITE,
+                weave::Limits::none(),
+            )
+            .unwrap();
+        b.access(&cap, &Resource::net("api.mail.example", 443), Rights::WRITE)
+            .unwrap();
+    }
+
+    // A has not looked again, so its model is still the stale, empty one.
+    let stale = Glass::new(&mut a)
+        .model_within(win, glass::DEFAULT_BUCKETS)
+        .unwrap();
+    assert!(stale.is_empty());
+    assert_eq!(stale.totals, before.totals);
+
+    // After the broker reloads, the model folds in the live network channel.
+    assert!(a.reload().unwrap());
+    let after = Glass::new(&mut a)
+        .model_within(win, glass::DEFAULT_BUCKETS)
+        .unwrap();
+    assert!(!after.is_empty());
+    assert_ne!(after.totals, before.totals);
+    assert_eq!(after.totals.principals, 1);
+    assert_eq!(after.totals.network, 1);
+    assert_eq!(after.totals.live, 1);
+    let channel = &after.principals[0].channels[0];
+    assert_eq!(channel.status, ChannelStatus::Live);
+    assert_eq!(channel.uses, 1);
+}

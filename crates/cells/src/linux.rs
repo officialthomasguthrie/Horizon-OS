@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::sys::statvfs::{statvfs, FsFlags};
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{chdir, execve, fork, pivot_root, sethostname, ForkResult};
 
 use crate::{seccomp, Cell, Error, Payload, Result, Seccomp, Status};
@@ -97,6 +97,9 @@ pub(crate) struct ChildHandle {
     a_pid: nix::unistd::Pid,
     report_r: RawFd,
     stage: String,
+    // Set once the cell has been collected (by try_wait): the report fd is closed
+    // and the staging dir removed, so it must not be touched again.
+    collected: bool,
 }
 
 pub(crate) fn spawn(cell: Cell, payload: Payload) -> Result<ChildHandle> {
@@ -114,12 +117,16 @@ pub(crate) fn spawn(cell: Cell, payload: Payload) -> Result<ChildHandle> {
                 a_pid: child,
                 report_r,
                 stage,
+                collected: false,
             })
         }
     }
 }
 
 pub(crate) fn wait(h: ChildHandle) -> Result<Status> {
+    if h.collected {
+        return Err(Error::Confine("cell already collected".into()));
+    }
     let out = read_report(h.report_r);
     close(h.report_r);
     let _ = waitpid(h.a_pid, None);
@@ -127,6 +134,39 @@ pub(crate) fn wait(h: ChildHandle) -> Result<Status> {
     // leftover on the host; remove it.
     let _ = std::fs::remove_dir(&h.stage);
     out
+}
+
+// Reap the cell if it has finished, without blocking. waitpid(WNOHANG) on the
+// init child A is the probe: while A is alive the payload has not finished, and
+// once A has exited it has already written the report (bridge() writes it before
+// A exits), so the follow-up report read does not block. A long-lived supervisor
+// (the shell that launches apps) collects exited children on a timer this way
+// instead of blocking on each. Collected at most once: on the transition the
+// report fd is closed and the staging dir removed, and later calls report None.
+pub(crate) fn try_wait(h: &mut ChildHandle) -> Result<Option<Status>> {
+    if h.collected {
+        return Ok(None);
+    }
+    match waitpid(h.a_pid, Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::StillAlive) => Ok(None),
+        Ok(_) => {
+            let out = read_report(h.report_r);
+            collect(h);
+            out.map(Some)
+        }
+        // Already reaped elsewhere: nothing to collect, just tidy up.
+        Err(nix::errno::Errno::ECHILD) => {
+            collect(h);
+            Ok(None)
+        }
+        Err(e) => Err(Error::Confine(format!("try_wait: {e}"))),
+    }
+}
+
+fn collect(h: &mut ChildHandle) {
+    h.collected = true;
+    close(h.report_r);
+    let _ = std::fs::remove_dir(&h.stage);
 }
 
 pub(crate) fn run(cell: Cell, payload: Payload) -> Result<Status> {

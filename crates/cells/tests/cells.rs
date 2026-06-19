@@ -203,6 +203,56 @@ fn the_payload_exit_code_comes_back() {
     assert!(!st.success());
 }
 
+#[test]
+fn try_wait_collects_a_finished_cell_without_blocking() {
+    if skip_if_unavailable() {
+        return;
+    }
+    // The payload blocks reading a pipe until we let it finish, so we can watch
+    // try_wait go from "still running" to the exit status with no blocking wait,
+    // the way the shell reaps launched apps on its poll tick.
+    let mut fds = [0 as RawFd; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (r, w) = (fds[0], fds[1]);
+
+    let mut child = Cell::new()
+        .keep_fd(r)
+        .spawn(Payload::call(move || {
+            let mut b = [0u8; 1];
+            let n = unsafe { libc::read(r, b.as_mut_ptr() as *mut libc::c_void, 1) };
+            if n == 1 {
+                7
+            } else {
+                1
+            }
+        }))
+        .expect("spawn cell");
+
+    // Still blocked on the read: try_wait reports it running, without blocking.
+    assert!(
+        matches!(child.try_wait(), Ok(None)),
+        "cell reported done while still blocked"
+    );
+
+    // Release it, then collect the exit code without a blocking wait.
+    assert_eq!(
+        unsafe { libc::write(w, b"x".as_ptr() as *const libc::c_void, 1) },
+        1
+    );
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => std::thread::yield_now(),
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+    };
+    assert_eq!(status.code, Some(7));
+    unsafe {
+        libc::close(w);
+        libc::close(r);
+    }
+}
+
 // Find a host binary, or None so the test skips on a box that lacks it.
 fn host_program(name: &str) -> Option<PathBuf> {
     for dir in ["/bin", "/usr/bin"] {

@@ -1052,6 +1052,104 @@ fn compositor_show(background: Option<&Path>, days: u64) -> Result<()> {
 ))]
 const SHELL_POLL: Duration = Duration::from_millis(500);
 
+// A launched palette client runs confined in a Cell, so it starts with no ambient
+// authority: no host files, no network, no devices. Its one channel is the Wayland
+// connection to this compositor, which is the display capability you grant by
+// launching it; the compositor mediates everything over that socket. Further
+// authority (a file, the network) is a Weave grant brokered later, not something
+// the app holds by virtue of running as you.
+//
+// Reaching the display from inside the empty world takes two things: the host's
+// read-only system directories (bind_host_system) so a dynamically linked client
+// finds its interpreter and libraries, and the compositor's Wayland socket bound
+// in at the one path the client looks for it. The net namespace stays empty: a
+// Wayland socket is a pathname Unix socket, a filesystem rendezvous rather than a
+// network one, so connecting to it crosses an empty network namespace (only an
+// abstract socket or real networking would not). No host data is bound: no home,
+// no other contents of the host runtime dir. A GPU client would also need a render
+// node (/dev/dri), deliberately not granted, so it cannot reach the GPU; an shm
+// client composites fine, which is what the compositor imports.
+
+// Inside the cell the socket is bound here and the client is pointed at it. A
+// fixed name decouples the in-cell path from the host's wayland-N, and a private
+// runtime dir keeps the client from seeing anything else under the host's.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "compositor-winit", feature = "compositor-udev")
+))]
+const CELL_RUNTIME_DIR: &str = "/run/horizon";
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "compositor-winit", feature = "compositor-udev")
+))]
+const CELL_WAYLAND_NAME: &str = "wayland-0";
+
+// Where the Wayland socket is bound inside the cell: the runtime dir joined with
+// the display name, so XDG_RUNTIME_DIR + WAYLAND_DISPLAY resolve to exactly it.
+// This equality is the invariant a confined client relies on to connect.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "compositor-winit", feature = "compositor-udev")
+))]
+fn cell_wayland_socket() -> PathBuf {
+    Path::new(CELL_RUNTIME_DIR).join(CELL_WAYLAND_NAME)
+}
+
+// The host path of the compositor's listening socket: WAYLAND_DISPLAY under
+// XDG_RUNTIME_DIR, or the display itself when it is already an absolute path.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "compositor-winit", feature = "compositor-udev")
+))]
+fn host_wayland_socket(runtime: &Path, display: &str) -> PathBuf {
+    let p = Path::new(display);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        runtime.join(display)
+    }
+}
+
+// The environment a confined client sees: a private writable runtime dir holding
+// only the brokered Wayland socket, the matching display name, a minimal PATH into
+// the bound system dirs, and a HOME. Nothing from the host's runtime dir leaks in.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "compositor-winit", feature = "compositor-udev")
+))]
+fn client_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    use std::ffi::OsString;
+    vec![
+        (
+            OsString::from("WAYLAND_DISPLAY"),
+            OsString::from(CELL_WAYLAND_NAME),
+        ),
+        (
+            OsString::from("XDG_RUNTIME_DIR"),
+            OsString::from(CELL_RUNTIME_DIR),
+        ),
+        (
+            OsString::from("PATH"),
+            OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"),
+        ),
+        (OsString::from("HOME"), OsString::from("/")),
+    ]
+}
+
+// Build the cell for a launched Wayland client: the host's read-only system for
+// libraries, the compositor's Wayland socket bound in writable at the one path the
+// client is pointed at, and nothing else. See the note above on why the empty net
+// namespace still reaches the display and what is deliberately withheld.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "compositor-winit", feature = "compositor-udev")
+))]
+fn client_cell(host_sock: &Path) -> cells::Cell {
+    cells::Cell::new()
+        .bind_host_system()
+        .bind_rw(host_sock, cell_wayland_socket())
+}
+
 // The interactive Glass shell behind an on-screen backend. It holds the broker,
 // the window it summarizes, the cached model, the Aura command palette, and the
 // last scene it drew. A pointer click resolves against the scene's hit targets and
@@ -1077,8 +1175,12 @@ struct Shell {
     height: u32,
     // WAYLAND_DISPLAY a launched client connects back to (this compositor).
     wayland_display: String,
-    // Apps launched from the palette, kept so the tick can reap the exited ones.
-    children: Vec<std::process::Child>,
+    // The host XDG_RUNTIME_DIR the compositor's socket lives under, used to find
+    // it on disk so it can be bound into a launched client's cell.
+    host_runtime: PathBuf,
+    // Apps launched from the palette, each confined in its own Cell, kept so the
+    // tick can reap the exited ones.
+    children: Vec<cells::Child>,
     // When the store was last polled, so the render loop's per-frame Tick costs a
     // clock check until SHELL_POLL elapses.
     last_poll: std::time::Instant,
@@ -1099,6 +1201,12 @@ impl Shell {
         height: u32,
         wayland_display: &str,
     ) -> Result<(Shell, Vec<u8>)> {
+        // The compositor sets XDG_RUNTIME_DIR before opening the shell (its own
+        // socket lives under it); the launch path needs it to find that socket on
+        // disk and bind it into a client cell.
+        let host_runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR is unset"))?;
         let mut broker = open_broker(store)?;
         let window = glass::Window::days(now_unix(), days);
         let model = glass::Glass::new(&mut broker).model_within(window, glass::DEFAULT_BUCKETS)?;
@@ -1115,6 +1223,7 @@ impl Shell {
                 width,
                 height,
                 wayland_display: wayland_display.to_string(),
+                host_runtime,
                 children: Vec::new(),
                 last_poll: std::time::Instant::now(),
             },
@@ -1239,26 +1348,36 @@ impl Shell {
         }
     }
 
-    // Spawn a Wayland client connected to this compositor. It inherits the
-    // environment (so XDG_RUNTIME_DIR is set) plus WAYLAND_DISPLAY pointing at our
-    // socket, so its window maps into this scene. The child is kept so the tick can
-    // reap it. Confining the client in a Cell is the next step (the cells exec path
-    // is ready); a plain spawn is the first cut.
+    // Launch a Wayland client confined in a Cell connected to this compositor (see
+    // the note on client_cell for the confinement). The program is resolved against
+    // the host's standard binary dirs, which bind_host_system mounts at the same
+    // paths inside, so the resolved path execs in the cell; the compositor's socket
+    // is bound in and the env points the client at it, so its window maps into this
+    // scene. The child is kept so the tick can reap it.
     fn launch(&mut self, cmd: &str) -> Result<()> {
         let mut parts = cmd.split_whitespace();
         let program = parts.next().ok_or_else(|| anyhow!("no program named"))?;
-        let args: Vec<&str> = parts.collect();
-        let child = std::process::Command::new(program)
-            .args(&args)
-            .env("WAYLAND_DISPLAY", &self.wayland_display)
-            .spawn()
-            .with_context(|| format!("spawn {program}"))?;
+        let path = resolve_program(program)
+            .ok_or_else(|| anyhow!("command not found on host: {program}"))?;
+        let argv: Vec<std::ffi::OsString> = std::iter::once(std::ffi::OsString::from(program))
+            .chain(parts.map(std::ffi::OsString::from))
+            .collect();
+
+        let host_sock = host_wayland_socket(&self.host_runtime, &self.wayland_display);
+        let child = client_cell(&host_sock)
+            .spawn(cells::Payload::Exec {
+                path,
+                argv,
+                env: client_env(),
+            })
+            .map_err(|e| anyhow!("confine {program}: {e}"))?;
         self.children.push(child);
         Ok(())
     }
 
-    // Reap launched apps that have exited, so they do not linger as zombies. Keep
-    // the ones still running (try_wait yields Ok(None)).
+    // Reap launched apps that have exited, so they do not linger as zombies (the
+    // cell's init child is our direct child and must be collected). Keep the ones
+    // still running (try_wait yields Ok(None)); drop the finished and the failed.
     fn reap(&mut self) {
         self.children
             .retain_mut(|c| matches!(c.try_wait(), Ok(None)));
@@ -1844,4 +1963,132 @@ fn derive(pass: &str, salt: &[u8]) -> [u8; 32] {
         .hash_password_into(pass.as_bytes(), salt, &mut key)
         .expect("argon2 derive");
     key
+}
+
+// The cell a launched palette client runs in: the construction (binds + env) is
+// pure and assertable here without a screen; only the client actually mapping a
+// window needs one. The connect test proves the harder claim, that the empty net
+// namespace still reaches the display, by connecting through the bound socket.
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(feature = "compositor-winit", feature = "compositor-udev")
+))]
+mod client_cell_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn host_socket_path_joins_a_name_and_passes_an_absolute_through() {
+        let rt = Path::new("/run/user/1000");
+        // A bare WAYLAND_DISPLAY name resolves under the host runtime dir.
+        assert_eq!(
+            host_wayland_socket(rt, "wayland-1"),
+            Path::new("/run/user/1000/wayland-1")
+        );
+        // An absolute one is taken as-is.
+        assert_eq!(
+            host_wayland_socket(rt, "/tmp/x/wayland-3"),
+            Path::new("/tmp/x/wayland-3")
+        );
+    }
+
+    #[test]
+    fn the_client_env_points_at_the_bound_socket() {
+        // The invariant that lets a confined client connect: XDG_RUNTIME_DIR plus
+        // WAYLAND_DISPLAY resolve to exactly where the socket is bound.
+        let env = client_env();
+        let get = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{k} not set in client env"))
+        };
+        let resolved = Path::new(&get("XDG_RUNTIME_DIR")).join(get("WAYLAND_DISPLAY"));
+        assert_eq!(resolved, cell_wayland_socket());
+    }
+
+    #[test]
+    fn the_client_cell_binds_the_socket_and_the_host_system_only() {
+        let host = Path::new("/run/user/1000/wayland-7");
+        let binds = client_cell(host);
+        let binds = binds.binds();
+        // The compositor's socket is bound writable where the client looks.
+        assert!(
+            binds
+                .iter()
+                .any(|b| b.src == host && b.dst == cell_wayland_socket() && b.writable),
+            "wayland socket not bound where the env points"
+        );
+        // bind_host_system supplied the libraries (read-only).
+        assert!(
+            binds
+                .iter()
+                .any(|b| b.dst == Path::new("/usr") && !b.writable),
+            "host /usr not bound read-only"
+        );
+        // No home or other host data crept in.
+        assert!(
+            !binds.iter().any(|b| b.dst.starts_with("/home")),
+            "a home directory was bound into the client cell"
+        );
+    }
+
+    #[test]
+    fn a_confined_client_can_reach_the_bound_socket() {
+        // The hard part, proven headlessly: a client in the empty-net cell can
+        // connect to the compositor's Wayland socket through the bind. Mapping a
+        // window still needs a screen; reaching the display does not. Skipped
+        // where unprivileged user namespaces are unavailable.
+        if !cells::available() {
+            eprintln!("skipping: unprivileged user namespaces unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let host_sock = dir.path().join("wayland-host");
+        // Stand in for the compositor: a real listening socket at the host path.
+        let _listener = UnixListener::bind(&host_sock).unwrap();
+
+        let target = cell_wayland_socket();
+        let status = client_cell(&host_sock)
+            .run(cells::Payload::call(move || {
+                // Connect to the in-cell socket path with raw libc (fork-safe, no
+                // allocation). A pathname Unix socket crosses the empty net
+                // namespace, so this must succeed even with no network.
+                let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+                if fd < 0 {
+                    return 1;
+                }
+                let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+                addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+                let bytes = target.as_os_str().as_bytes();
+                if bytes.len() + 1 > addr.sun_path.len() {
+                    return 2;
+                }
+                for (i, b) in bytes.iter().enumerate() {
+                    addr.sun_path[i] = *b as libc::c_char;
+                }
+                let len = std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1;
+                let r = unsafe {
+                    libc::connect(
+                        fd,
+                        &addr as *const _ as *const libc::sockaddr,
+                        len as libc::socklen_t,
+                    )
+                };
+                unsafe { libc::close(fd) };
+                if r == 0 {
+                    0
+                } else {
+                    3
+                }
+            }))
+            .expect("run client cell");
+        assert!(
+            status.success(),
+            "confined client could not reach the socket (code {:?})",
+            status.code
+        );
+    }
 }

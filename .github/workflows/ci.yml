@@ -45,3 +45,12 @@ jobs:
       # It links the DRM system libraries installed above.
       - run: cargo build -p compositor --features udev
       - run: cargo clippy -p compositor --all-targets --features udev -- -D warnings
+      # The horizon Glass shell behind the backends is feature-gated, so the
+      # default build above never compiles it. Lint and run it under one backend
+      # feature (the shell is shared by both): this compile-checks the shell and
+      # the confined-launch path and runs the headless client-cell tests, which
+      # assert the cell a launched client gets (the socket bound where its env
+      # points) and confirm a confined client reaches the display through the bind
+      # despite the empty network namespace. Needs the userns knob set above.
+      - run: cargo clippy -p horizon --all-targets --features compositor-winit -- -D warnings
+      - run: cargo test -p horizon --features compositor-winit

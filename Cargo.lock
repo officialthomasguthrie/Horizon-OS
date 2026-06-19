@@ -990,6 +990,7 @@ dependencies = [
  "lifestream",
  "rand 0.8.6",
  "reconstitution",
+ "tempfile",
  "weave",
 ]
 

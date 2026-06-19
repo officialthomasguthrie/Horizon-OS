@@ -625,6 +625,36 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   routing and the actual app spawn are the only parts that need a screen, eye-verified
   next, exactly as the rest of the backend is. Built and tested on darwin and in the
   Linux container.
+- Phase 3 Aura palette client confinement (`cells` + `horizon`): a client launched from
+  the palette now runs confined in a Cell, not a plain spawn, so it starts with no ambient
+  authority, no host files, no network, no devices. Its one channel is the Wayland
+  connection to this compositor, which is the display capability you grant by launching it
+  (the compositor mediates everything over that socket); any further authority is a Weave
+  grant brokered later, not something the app holds by virtue of running as you. Reaching
+  the display from the empty world takes two things, both already built: `bind_host_system`
+  for the interpreter and libraries, and the compositor's Wayland socket bound in writable
+  at the one path the client's env points at (`XDG_RUNTIME_DIR=/run/horizon` +
+  `WAYLAND_DISPLAY=wayland-0` resolve to exactly the bind target, the invariant a confined
+  client relies on). The net namespace stays empty: a Wayland socket is a pathname Unix
+  socket, a filesystem rendezvous rather than a network one, so connecting to it crosses an
+  empty network namespace (an abstract socket or real networking would not); no host data
+  is bound (no home, no other runtime-dir contents). A GPU client would also need a render
+  node (`/dev/dri`), deliberately withheld, so it cannot reach the GPU; an shm client, what
+  the compositor imports, composites fine. `cells` gained `Child::try_wait` (a non-blocking
+  reap) so the long-lived shell collects exited confined clients on its poll tick (the
+  cell's init child is a direct child and must be collected), plus a `Cell::binds()` read
+  accessor so a construction is assertable without spawning. On the usual headless split the
+  cell construction (binds + env) is pure and asserted with no screen, and a headless test
+  proves the harder claim, that the empty net namespace still reaches the display, by
+  connecting through the bound socket from inside a real cell; only the client actually
+  mapping a window needs a screen, eye-verified next. This also closes a CI gap: the horizon
+  Glass shell is feature-gated, so the default build never compiled it and only local gates
+  did; a new CI step lints and runs it under the winit feature. Tests: a `cells` unit that
+  `try_wait` reports running while the payload blocks then returns the exit code with no
+  blocking wait, and horizon units for the host socket path, the env-points-at-the-bound-
+  socket invariant, and that the cell binds the socket plus the read-only host system and no
+  home, then the connect-through-the-bind end-to-end. Built and tested on darwin and in the
+  Linux container.
 
 ## Next
 
@@ -666,10 +696,15 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   line (launch an app, sever channels by name, filter the view), `surface::layout` draws
   the input, caret, and feedback and filters the list, the compositor routes keystrokes to
   the shell when no client is focused (the new `ShellEvent::Key`), and the horizon `Shell`
-  runs a command on Enter, all headless-tested. What is left on the shell: confining a
-  launched client in a Cell (the exec path is ready; today it is a plain spawn), and the
-  eye-verify of the key routing and the spawn on a real screen. Confined cells can already
-  host compositor surfaces (the cells exec path is ready). Linux-only.
+  runs a command on Enter, all headless-tested. A launched client now runs confined in a
+  Cell, not a plain spawn: `bind_host_system` for libraries, the compositor's Wayland socket
+  bound in at the one path the client's env points at, an empty network namespace (a Wayland
+  pathname socket crosses it), and no host data, so an app starts with no ambient authority
+  beyond the display connection. `cells` gained a non-blocking `Child::try_wait` so the shell
+  reaps exited confined clients on its tick, and the cell construction is asserted headlessly
+  (including a real connect through the bound socket from inside the empty-net cell). What is
+  left on the shell is only the eye-verify of the key routing and a confined client mapping a
+  window on a real screen. Confined cells can already host compositor surfaces. Linux-only.
 - Glass: the live transparency surface over the weave audit log. The model layer
   and the drawn surface are both done (the `glass` crate: a pure fold of the
   broker's grant table and audit log into a per-principal map of
@@ -694,8 +729,10 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   line parses and resolves to launch an app, sever channels by name, or filter the view,
   drawn with a live caret and the resolved hint, fed by the compositor's `ShellEvent::Key`
   when no client is focused; parser, resolver, palette buffer, and rendering are all
-  headless-tested. Eye-verify on a screen; a confined cell can host it (the cells exec
-  path is ready).
+  headless-tested. A client launched from the palette now runs confined in a Cell (only the
+  Wayland socket reaches in, the net namespace is empty, no host data), with the cell
+  construction and a connect through the bound socket asserted headlessly. Eye-verify on a
+  screen.
 - Phase 5 Constellation real-host verification: the whole networking stack that
   can be built and tested on one host is done and in CI, the QUIC + Noise
   transport, serve/sync CLI, concurrent multi-peer serving, mDNS LAN discovery,

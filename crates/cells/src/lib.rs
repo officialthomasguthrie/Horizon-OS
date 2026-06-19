@@ -125,6 +125,13 @@ impl Cell {
         self
     }
 
+    // The binds configured on this cell, a read-only view for inspecting a
+    // construction without spawning (e.g. asserting what a launched client can
+    // reach).
+    pub fn binds(&self) -> &[Bind] {
+        &self.binds
+    }
+
     pub fn hostname(mut self, name: impl Into<String>) -> Cell {
         self.hostname = Some(name.into());
         self
@@ -198,6 +205,21 @@ impl Child {
         #[cfg(target_os = "linux")]
         {
             linux::wait(self.inner)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(Error::Unsupported)
+        }
+    }
+
+    // Collect the cell if it has finished, without blocking: `Ok(Some(status))`
+    // once the payload has exited, `Ok(None)` while it is still running. Lets a
+    // long-lived owner that spawned the cell (the shell launching apps) reap
+    // exited children on a timer rather than waiting on each.
+    pub fn try_wait(&mut self) -> Result<Option<Status>> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::try_wait(&mut self.inner)
         }
         #[cfg(not(target_os = "linux"))]
         {

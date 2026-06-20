@@ -16,7 +16,9 @@ use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, Mode as CalloopMode, PostAction};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use smithay::reexports::wayland_server::backend::{
+    ClientData, ClientId, DisconnectReason, GlobalId,
+};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_shm;
@@ -116,6 +118,17 @@ fn shell_key(sym: Keysym) -> Option<ShellKey> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OutputId(u32);
 
+// An output placed in the shared logical space through the id-based API: the
+// smithay `Output` (its mode/scale/location source and the Space mapping) plus the
+// `wl_output` global that advertises this monitor to clients, so a client
+// enumerates it and reads its logical position and mode. Removing the output
+// withdraws the global.
+#[cfg(feature = "render")]
+struct PlacedOutput {
+    output: Output,
+    global: GlobalId,
+}
+
 // Everything the protocol handlers touch. The `Compositor` keeps this next to
 // the `Display` so dispatch can hand it to both calloop and the Wayland core.
 struct State {
@@ -124,23 +137,33 @@ struct State {
     shm: ShmState,
     xdg: XdgShellState,
     seats: SeatState<State>,
-    // The seat carries the keyboard and pointer; the input methods below drive
-    // it. The output global is advertised for its lifetime and held so it is not
-    // withdrawn (we do not read `outputs` back: there is only the one output).
+    // The seat carries the keyboard and pointer; the input methods below drive it.
     seat: Seat<State>,
     #[allow(dead_code)]
     outputs: OutputManagerState,
+    // The default placeholder output: the single virtual screen the headless core
+    // and the winit nested window present. The DRM backend and the headless
+    // multi-monitor API place their own outputs instead and retire this one's
+    // global (see `placeholder_global`).
     #[allow(dead_code)]
     output: Output,
+    // The placeholder output's `wl_output` global while it is advertised, else None
+    // while it is withdrawn in favour of explicit outputs (the headless
+    // `add_output` monitors or the DRM connectors). Advertised by default so the
+    // headless core and winit show one screen; withdrawn the moment a real output
+    // is placed, so a client enumerates the actual monitors instead of a phantom.
+    #[allow(dead_code)]
+    placeholder_global: Option<GlobalId>,
     space: Space<Window>,
     // Outputs placed in the shared logical space through the id-based API, keyed by
     // their handle, so `render_output` can find one to read back and `move_output`
-    // can relocate it. The default `output` above is the always-present placeholder
-    // the single-output paths use; these are extra ones a multi-monitor setup maps
-    // in (the headless mirror of what the DRM backend builds from real connectors).
-    // Render-gated: it exists to drive the offscreen per-output readback.
+    // can relocate it. Each carries its own `wl_output` global, so a client
+    // enumerates these monitors. The default `output` above is the always-present
+    // placeholder the single-output paths use; these are extra ones a multi-monitor
+    // setup maps in (the headless mirror of what the DRM backend builds from real
+    // connectors). Render-gated: it drives the offscreen per-output readback.
     #[cfg(feature = "render")]
-    extra_outputs: std::collections::HashMap<u32, Output>,
+    extra_outputs: std::collections::HashMap<u32, PlacedOutput>,
     #[cfg(feature = "render")]
     next_output_id: u32,
     // The shell background: the L5 home surface (Horizon draws Glass here) painted
@@ -181,6 +204,26 @@ impl State {
             .elements()
             .find(|w| w.toplevel().map(|t| t.wl_surface()) == Some(surface))
             .cloned()
+    }
+}
+
+// Toggle the placeholder output's `wl_output` global. The default output stands in
+// for the single screen until explicit outputs (the headless `add_output` monitors
+// or the real DRM connectors) are placed; then its global is withdrawn so clients
+// enumerate the real monitors, and restored when the last explicit output is
+// removed so a client still sees one screen. Idempotent. Only the multi-output
+// paths call this, and every build that compiles them enables `render` (winit and
+// udev both turn it on), so it is render-gated.
+#[cfg(feature = "render")]
+impl State {
+    fn set_placeholder_global(&mut self, advertised: bool) {
+        if advertised && self.placeholder_global.is_none() {
+            self.placeholder_global = Some(self.output.create_global::<State>(&self.dh));
+        } else if !advertised {
+            if let Some(id) = self.placeholder_global.take() {
+                self.dh.remove_global::<State>(id);
+            }
+        }
     }
 }
 
@@ -506,7 +549,7 @@ impl Compositor {
             size: (1920, 1080).into(),
             refresh: 60_000,
         };
-        output.create_global::<State>(&dh);
+        let placeholder_global = output.create_global::<State>(&dh);
         output.change_current_state(
             Some(mode),
             Some(Transform::Normal),
@@ -527,6 +570,7 @@ impl Compositor {
             seat,
             outputs,
             output,
+            placeholder_global: Some(placeholder_global),
             space,
             #[cfg(feature = "render")]
             extra_outputs: std::collections::HashMap::new(),
@@ -690,9 +734,10 @@ impl Compositor {
     /// build a multi-monitor arrangement: each added output owns its region, so a
     /// window at a logical position shows on whichever output covers it and each
     /// reads back only its own slice (the same per-output rendering the DRM backend
-    /// scans out from real connectors). The output advertises no `wl_output` global
-    /// (clients still see the default one), so it is a render/scene construct, not a
-    /// new thing clients enumerate.
+    /// scans out from real connectors). The output advertises its own `wl_output`
+    /// global at this logical position and mode, so a client enumerates it as a
+    /// distinct monitor; the first added output retires the default placeholder
+    /// global so clients see the real monitors, not a phantom.
     #[cfg(feature = "render")]
     pub fn add_output(&mut self, name: &str, width: i32, height: i32, x: i32, y: i32) -> OutputId {
         let output = Output::new(
@@ -715,10 +760,16 @@ impl Compositor {
             Some((x, y).into()),
         );
         output.set_preferred(mode);
+        let global = output.create_global::<State>(&self.state.dh);
         self.state.space.map_output(&output, (x, y));
+        // The first explicit monitor retires the placeholder global, so a client
+        // enumerates the real outputs and not the phantom default.
+        self.state.set_placeholder_global(false);
         let id = self.state.next_output_id;
         self.state.next_output_id += 1;
-        self.state.extra_outputs.insert(id, output);
+        self.state
+            .extra_outputs
+            .insert(id, PlacedOutput { output, global });
         OutputId(id)
     }
 
@@ -726,16 +777,31 @@ impl Compositor {
     /// A no-op for an unknown handle.
     #[cfg(feature = "render")]
     pub fn move_output(&mut self, id: OutputId, x: i32, y: i32) {
-        if let Some(output) = self.state.extra_outputs.get(&id.0).cloned() {
+        if let Some(output) = self
+            .state
+            .extra_outputs
+            .get(&id.0)
+            .map(|p| p.output.clone())
+        {
+            // Update the advertised location (what the `wl_output` global reports to
+            // clients) and the Space mapping (the region it renders) together, so a
+            // client sees the monitor move and the output scans out its new region.
+            output.change_current_state(None, None, None, Some((x, y).into()));
             self.state.space.map_output(&output, (x, y));
         }
     }
 
-    /// Remove an added output from the shared space. A no-op for an unknown handle.
+    /// Remove an added output from the shared space, withdrawing its `wl_output`
+    /// global. A no-op for an unknown handle. Removing the last added output brings
+    /// the placeholder global back, so a client still sees one screen.
     #[cfg(feature = "render")]
     pub fn remove_output(&mut self, id: OutputId) {
-        if let Some(output) = self.state.extra_outputs.remove(&id.0) {
-            self.state.space.unmap_output(&output);
+        if let Some(placed) = self.state.extra_outputs.remove(&id.0) {
+            self.state.space.unmap_output(&placed.output);
+            self.state.dh.remove_global::<State>(placed.global);
+            if self.state.extra_outputs.is_empty() {
+                self.state.set_placeholder_global(true);
+            }
         }
     }
 
@@ -750,7 +816,7 @@ impl Compositor {
             .state
             .extra_outputs
             .get(&id.0)
-            .cloned()
+            .map(|p| p.output.clone())
             .ok_or_else(|| Error::Render("unknown output".into()))?;
         crate::render::render_output(&self.state.space, &output, self.state.background.as_ref())
     }

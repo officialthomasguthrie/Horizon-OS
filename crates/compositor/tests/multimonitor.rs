@@ -11,6 +11,7 @@
 
 #![cfg(all(target_os = "linux", feature = "render"))]
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
@@ -24,11 +25,12 @@ use compositor::Compositor;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
 use wayland_client::protocol::wl_compositor::{self, WlCompositor};
+use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_shm_pool::{self, WlShmPool};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
-use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
 use wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
 use wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
 use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
@@ -80,7 +82,7 @@ fn spawn_window(path: PathBuf) -> (Receiver<()>, mpsc::Sender<()>, thread::JoinH
         let conn = Connection::from_socket(UnixStream::connect(&path).unwrap()).unwrap();
         let (globals, mut queue) = registry_queue_init::<App>(&conn).unwrap();
         let qh = queue.handle();
-        let mut app = App;
+        let mut app = App::default();
 
         let wl_compositor: WlCompositor = globals.bind(&qh, 1..=1, ()).unwrap();
         let wm_base: XdgWmBase = globals.bind(&qh, 1..=1, ()).unwrap();
@@ -228,7 +230,171 @@ fn moving_an_output_shifts_the_region_it_renders() {
     client.join().unwrap();
 }
 
-struct App;
+// Two outputs side by side, each advertised to clients as its own wl_output. A
+// client enumerates exactly the two monitors (the default placeholder is retired
+// once real outputs are placed), reads each one's logical position and mode, and a
+// window at the origin is told it entered only the left output, the one its region
+// covers. So the per-monitor globals are real and wired to the shared layout, not
+// just minted: a client learns where each screen is and which one a window is on.
+#[test]
+fn clients_enumerate_one_wl_output_per_monitor() {
+    let _ = runtime_dir();
+    let mut comp = Compositor::new().expect("start compositor");
+    let path = runtime_dir().join(comp.socket_name());
+
+    comp.add_output("LEFT", OW, OH, 0, 0);
+    comp.add_output("RIGHT", OW, OH, OW, 0);
+
+    let (tx, rx) = mpsc::channel::<Summary>();
+    let client = thread::spawn(move || tx.send(probe(path)).unwrap());
+    let summary = pump_until(&mut comp, &rx, "probe results");
+    client.join().unwrap();
+
+    let left = OutInfo {
+        x: 0,
+        y: 0,
+        w: OW,
+        h: OH,
+    };
+    let right = OutInfo {
+        x: OW,
+        y: 0,
+        w: OW,
+        h: OH,
+    };
+
+    // Exactly one wl_output per monitor, each at its layout position and mode, and
+    // no phantom placeholder alongside them.
+    assert_eq!(
+        summary.outputs.len(),
+        2,
+        "one wl_output per monitor, no placeholder: {:?}",
+        summary.outputs
+    );
+    assert!(
+        summary.outputs.contains(&left),
+        "left monitor advertised at the origin: {:?}",
+        summary.outputs
+    );
+    assert!(
+        summary.outputs.contains(&right),
+        "right monitor advertised to its right: {:?}",
+        summary.outputs
+    );
+
+    // The window at the origin overlaps only the left monitor.
+    assert_eq!(
+        summary.entered,
+        vec![left],
+        "surface should enter only the left output: {:?}",
+        summary.entered
+    );
+}
+
+// Connect a client, bind every wl_output, map a WIN x WIN window at the scene
+// origin, and settle until the surface has entered an output. Returns what the
+// client saw: the enumerated outputs and the ones it entered.
+fn probe(path: PathBuf) -> Summary {
+    let conn = Connection::from_socket(UnixStream::connect(&path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<App>(&conn).unwrap();
+    let qh = queue.handle();
+    let mut app = App::default();
+
+    // Bind every advertised output (udata = its registry name, so its events and a
+    // later surface.enter resolve back to it).
+    for global in globals.contents().clone_list() {
+        if global.interface == "wl_output" {
+            let output: WlOutput =
+                globals
+                    .registry()
+                    .bind(global.name, global.version, &qh, global.name);
+            app.bound.push((output, global.name));
+        }
+    }
+
+    // Map a window at the scene origin (lands on the left output).
+    let wl_compositor: WlCompositor = globals.bind(&qh, 1..=1, ()).unwrap();
+    let wm_base: XdgWmBase = globals.bind(&qh, 1..=1, ()).unwrap();
+    let shm: WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = wl_compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let toplevel = xdg_surface.get_toplevel(&qh, ());
+    toplevel.set_title("horizon-probe".to_string());
+    surface.commit();
+    queue.roundtrip(&mut app).unwrap();
+
+    let stride = WIN * 4;
+    let len = (stride * WIN) as usize;
+    let mut file = tempfile::tempfile().unwrap();
+    let mut bytes = Vec::with_capacity(len);
+    for _ in 0..(WIN * WIN) {
+        bytes.extend_from_slice(&MAGENTA.to_le_bytes());
+    }
+    file.write_all(&bytes).unwrap();
+    file.flush().unwrap();
+    let pool = shm.create_pool(file.as_fd(), len as i32, &qh, ());
+    let buffer = pool.create_buffer(0, WIN, WIN, stride, wl_shm::Format::Argb8888, &qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage(0, 0, WIN, WIN);
+    surface.commit();
+
+    // Settle: the output geometry/mode arrive right after binding; the surface
+    // enter follows once the buffer maps and the server refreshes. Roundtrip until
+    // both have landed, bounded so a missing event fails the assertion, not hangs.
+    for _ in 0..30 {
+        queue.roundtrip(&mut app).unwrap();
+        let outputs_ready =
+            app.info.len() == app.bound.len() && app.info.values().all(|i| i.w > 0 && i.h > 0);
+        if outputs_ready && !app.entered.is_empty() {
+            break;
+        }
+    }
+
+    let mut outputs: Vec<OutInfo> = app.info.values().copied().collect();
+    outputs.sort_by_key(|o| o.x);
+    // Resolve entered names to geometries, de-duplicated in arrival order.
+    let mut seen = HashSet::new();
+    let entered: Vec<OutInfo> = app
+        .entered
+        .iter()
+        .filter(|name| seen.insert(**name))
+        .filter_map(|name| app.info.get(name).copied())
+        .collect();
+
+    Summary { outputs, entered }
+}
+
+// One advertised monitor as a client sees it: its logical position (the
+// `wl_output.geometry` x/y) and its current mode size (the `wl_output.mode` w/h).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OutInfo {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+// The client's view after probing: every `wl_output` it enumerated, and the
+// outputs its surface was told it entered. Sent back to the test thread.
+struct Summary {
+    outputs: Vec<OutInfo>,
+    entered: Vec<OutInfo>,
+}
+
+// The in-process client. Unit-struct-like for the render tests (which never bind a
+// wl_output, so the fields stay empty), but it also records what the output-probe
+// test needs: each bound output's geometry/mode, keyed by its registry name, and
+// which outputs the surface entered.
+#[derive(Default)]
+struct App {
+    // (proxy, registry name) for each bound wl_output, so a surface.enter (which
+    // carries the output proxy) resolves back to a name.
+    bound: Vec<(WlOutput, u32)>,
+    // Registry name -> geometry/mode collected from the output's events.
+    info: HashMap<u32, OutInfo>,
+    // Registry names of the outputs the surface entered, in arrival order.
+    entered: Vec<u32>,
+}
 
 impl Dispatch<WlRegistry, GlobalListContents> for App {
     fn event(
@@ -256,13 +422,55 @@ impl Dispatch<WlCompositor, ()> for App {
 
 impl Dispatch<WlSurface, ()> for App {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &WlSurface,
-        _: wl_surface::Event,
+        event: wl_surface::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        // The compositor tells the surface which output(s) it is on. Resolve the
+        // output proxy back to the registry name we bound it under.
+        if let wl_surface::Event::Enter { output } = event {
+            if let Some((_, name)) = state.bound.iter().find(|(o, _)| o == &output) {
+                state.entered.push(*name);
+            }
+        }
+    }
+}
+
+impl Dispatch<WlOutput, u32> for App {
+    fn event(
+        state: &mut Self,
+        _: &WlOutput,
+        event: wl_output::Event,
+        name: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let info = state.info.entry(*name).or_default();
+        match event {
+            // The output's position in the global compositor space: its logical
+            // position at scale 1, what the layout placed it at.
+            wl_output::Event::Geometry { x, y, .. } => {
+                info.x = x;
+                info.y = y;
+            }
+            // The current mode carries the pixel size. Other (non-current) modes
+            // would arrive with the flag clear; this compositor advertises one.
+            wl_output::Event::Mode {
+                flags,
+                width,
+                height,
+                ..
+            } => {
+                if matches!(flags, WEnum::Value(f) if f.contains(wl_output::Mode::Current)) {
+                    info.w = width;
+                    info.h = height;
+                }
+            }
+            _ => {}
+        }
     }
 }
 

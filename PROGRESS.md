@@ -687,6 +687,37 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   Advertising each output to clients as its own `wl_output` global, and per-output
   scale, are the remaining multi-monitor gaps. Built and tested on darwin (layout)
   and in the Linux container (render + udev).
+- Phase 3 compositor per-monitor wl_output globals (`compositor`, Linux): each
+  output placed in the shared logical space is now advertised to clients as its own
+  `wl_output` global, so a Wayland client enumerates one output per physical monitor
+  and learns each one's logical position, mode, and scale, instead of seeing a
+  single phantom output stretched across the whole desktop. This is the next of the
+  two remaining multi-monitor gaps after the logical layout (per-output scale is the
+  last). The default placeholder output (the single virtual screen the headless core
+  and the winit nested window present) keeps its global only while no explicit
+  output exists: the first placed output, a headless `add_output` monitor or a real
+  DRM connector, retires it so clients see the real monitors and not the phantom, and
+  it is restored when the last one goes away so a client still sees one screen.
+  `move_output` and the DRM `map_output` keep each output's advertised location in
+  step with its Space mapping (so a client sees a monitor where the layout placed
+  it), and removing an output withdraws its global. On the usual headless split the
+  whole client-visible behavior is proven without a display: a new test places two
+  outputs through the id-based API and a real in-process Wayland client binds every
+  `wl_output`, reads each one's geometry and mode (asserting one global per monitor
+  at the right position and size, with the placeholder gone), and is told its window
+  entered only the output whose region covers it, so the globals are real and wired
+  to the shared layout, not just minted. The bare-metal DRM backend advertises each
+  lit connector the same way: a global created when the connector is lit, withdrawn
+  when it is unplugged or its GPU is removed, the placeholder retired while any real
+  monitor exists. Because creating a global names the private server `State` the
+  display handle is typed against (which the DRM module cannot reach), the create and
+  withdraw are free functions in the server module that the backend calls with a
+  display handle it now holds, since the connector scan has no compositor in hand.
+  Like the rest of the DRM backend it is compile-checked and clippy-clean under
+  `udev` and eye-verified on hardware next. Per-output scale, and a display-only
+  secondary GPU, are the remaining multi-monitor and DRM gaps. The headless client
+  test runs in the Linux container under `render`; the DRM half is compile-checked
+  under `udev`.
 
 ## Next
 
@@ -715,11 +746,15 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   rendering, read back through the software renderer with an id-based output API) and
   eye-verified on hardware next; what is left on the backend is the display-only
   secondary GPU (render on one card, scan out on another, the one cross-GPU case shm
-  sidesteps), plus advertising each output to clients as its own `wl_output` global
-  and per-output scale. The shell proper has started: the compositor now draws a
-  full-screen background (the Glass L5 desktop, a pure Model -> Scene -> Pixmap
-  renderer in the `glass` crate) behind client windows, proven on the headless
-  pixman path and wired into the winit backend, with `horizon compositor
+  sidesteps) and per-output scale. Advertising each output to clients as its own
+  `wl_output` global is now done: every output placed in the shared space (a headless
+  `add_output` monitor or a real DRM connector) carries its own global at its logical
+  position and mode, the phantom placeholder retired while any real monitor exists,
+  proven headlessly by a client that enumerates one `wl_output` per monitor and a
+  window that enters only the output it covers. The shell proper has started: the
+  compositor now draws a full-screen background (the Glass L5 desktop, a pure Model
+  -> Scene -> Pixmap renderer in the `glass` crate) behind client windows, proven on
+  the headless pixman path and wired into the winit backend, with `horizon compositor
   screenshot --background <store>` showing the composited desktop, and a click on a
   Glass `sever` button is now routed back through `Glass::sever`: the compositor
   reports a press that hit no client window, Horizon resolves it through the scene

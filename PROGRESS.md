@@ -779,6 +779,51 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   is now feature-complete on the headless-buildable split, with only the on-hardware
   eye-verify left. Built and compile-checked from the Linux container on this
   display-less darwin host.
+- Phase 5 identity FIDO2 keyslots (`identity` crate + `horizon`): unlock a store's
+  master key with a FIDO2 security key, not only the passphrase, and make recovery
+  shares the way to enroll a fresh key when one is lost. Everything in Horizon turns
+  on one 32-byte master (the Lifestream derives its keys from it, the Constellation
+  binds Noise to it, Reconstitution splits it into k-of-n shares); the tools derive
+  it from a passphrase via Argon2id. This adds a second way to recover the same
+  master, so it is purely additive: no existing store, Lifestream, or Constellation
+  state changes, and it is reversible. The core is a keyslot. A FIDO2 authenticator's
+  CTAP2 hmac-secret extension returns a deterministic 32-byte secret for a credential
+  it holds and a salt, gated by a touch and never leaving the device; a `Keyslot`
+  seals the master under a wrap key derived from that secret (XChaCha20-Poly1305,
+  blake3-derived wrap key, the credential id as AAD) and stores only the credential
+  id and salt, so the sealed master plus the keyslot reveal nothing without the
+  device. A store holds a `keyslots` file of independent slots (`Keyslots`), one per
+  enrolled device; `unlock_any` returns the first master a slot yields. On the usual
+  headless split the security-critical part is a pure core tested with no hardware:
+  the sealing, the file format, and slot selection sit behind an `Authenticator`
+  trait, exercised against a `SoftwareAuthenticator` (a deterministic token a holder
+  keeps in a file, the test and dev seam, not hardware-backed). The real USB-HID
+  authenticator (`HardwareKey`, behind the `fido2` feature, Linux) is a thin
+  implementation of the same trait over `ctap-hid-fido2`: a non-resident credential
+  with hmac-secret at enroll, the per-credential secret read back for a salt at
+  unlock; it statically builds hidapi's hidraw backend (links libudev, already
+  present for the compositor's udev feature, so no new system package) and is
+  compile-checked in CI and verified on a real key, exactly as the compositor's
+  display backends sit behind its tested compositing core. The CLI ties it together:
+  `horizon identity enroll` (master from the passphrase, sealed into a keyslot),
+  `unlock` (the boot path: try the enrolled keyslots, fall back to the passphrase,
+  proven by decrypting HEAD), `reenroll --share` (rebuild the master from recovery
+  shares and seal it for a fresh device, the way back in for a lost key), and `list`;
+  `--token <file>` uses a software token, `--fido2` a real key in a build with that
+  feature. Recovery interoperates for free because shares and keyslots both yield the
+  same master. Tests: 7 identity unit tests (enroll/unlock roundtrip, a wrong token
+  refused, `unlock_any` over several slots, AEAD tamper rejection, encode/decode,
+  version and truncation checks) and a horizon end-to-end integration test (init a
+  store, enroll a token, persist and reload the keyslots, unlock, then recover the
+  master from 2-of-3 shares and enroll a new token, asserting the recovered key is
+  the original and opens the store), all on darwin and in the container. Also verified
+  end to end through the binary: init and snapshot a store, enroll a software token,
+  unlock with it with no passphrase (HEAD decrypts), split 2-of-3 recovery shares,
+  reenroll a new token from two of them, unlock with the new token, and confirm an
+  unenrolled token is refused and falls back to the passphrase. Left for the boot/
+  identity wiring: hooking `identity unlock` into the real boot/init sequence, and a
+  phone as a post-boot trusted device. Built and tested on darwin and in the Linux
+  container.
 
 ## Next
 
@@ -889,6 +934,16 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   and the simultaneous open are tested over loopback, but loopback has no NAT to
   cross), seeing which NAT types it opens against, and confirming the relay
   fallback carries the symmetric ones it cannot. Real-host and network work.
-- Phase 5 Reconstitution boot/identity wiring: bind recovery shares to FIDO2
-  re-enrollment and the boot-time unlock path, and a phone as a post-boot trusted
-  device. Linux-only; the secret-sharing core and CLI are done and cross-platform.
+- Phase 5 Reconstitution boot/identity wiring: the FIDO2 keyslot model is now done
+  (the `identity` crate: an `Authenticator` trait, AEAD keyslots that wrap the same
+  master the passphrase derives and the shares split, a `SoftwareAuthenticator` test
+  seam, and the real USB-HID `HardwareKey` over `ctap-hid-fido2`'s hmac-secret behind
+  the `fido2` feature), with `horizon identity enroll / unlock / reenroll / list`.
+  Recovery shares are bound to re-enrollment (`reenroll --share` rebuilds the master
+  and seals it for a fresh device), and `unlock` is the unlock path itself (try the
+  keyslots, fall back to the passphrase), all headless-tested with the software token
+  and verified through the binary; the real key is compile-checked in CI and
+  hardware-verified next. What is left is the boot integration proper: hooking
+  `identity unlock` into the real boot/init sequence (so a device boots into its
+  identity with a touch), and a phone as a post-boot trusted device. Linux for the
+  real key; the keyslot core, the secret-sharing core, and the CLI are cross-platform.

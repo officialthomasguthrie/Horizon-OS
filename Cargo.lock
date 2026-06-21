@@ -325,6 +325,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot"
+version = "0.0.0"
+dependencies = [
+ "argon2",
+ "identity",
+ "lifestream",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1189,7 +1200,7 @@ name = "horizon"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "argon2",
+ "boot",
  "cells",
  "clap",
  "compositor",

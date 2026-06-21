@@ -71,6 +71,33 @@ enum Cmd {
         #[command(subcommand)]
         op: CompositorOp,
     },
+    /// Bring this device up into its identity: unlock the store once (a security
+    /// key, a token, or the passphrase) and launch the desktop on that master
+    Boot {
+        /// The identity store to boot. If omitted, discover one under --root
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Where to look for the store when none is named: the store itself, or a
+        /// mount holding exactly one (a plugged-in Key)
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Unlock with a software token file instead of the passphrase
+        #[arg(long)]
+        token: Option<PathBuf>,
+        /// Unlock with a connected USB FIDO2 security key (a touch)
+        #[arg(long)]
+        fido2: bool,
+        /// Days of audit history the Glass desktop summarizes
+        #[arg(long, default_value_t = 7)]
+        days: u64,
+        /// Launch the nested (winit) session instead of the bare-metal (DRM) one,
+        /// for development inside an existing desktop
+        #[arg(long)]
+        nested: bool,
+        /// Unlock and prove the store but do not launch the desktop (the boot check)
+        #[arg(long)]
+        no_session: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -374,6 +401,15 @@ fn main() -> Result<()> {
         Cmd::Constellation { op } => constellation_cmd(op),
         Cmd::Cell { op } => cell_cmd(op),
         Cmd::Compositor { op } => compositor_cmd(op),
+        Cmd::Boot {
+            store,
+            root,
+            token,
+            fido2,
+            days,
+            nested,
+            no_session,
+        } => boot_cmd(store, root, token, fido2, days, nested, no_session),
     }
 }
 
@@ -880,9 +916,11 @@ fn compositor_cmd(op: CompositorOp) -> Result<()> {
             days,
         } => compositor_screenshot(&out, seconds, background.as_deref(), days),
         #[cfg(feature = "compositor-winit")]
-        CompositorOp::Show { background, days } => compositor_show(background.as_deref(), days),
+        CompositorOp::Show { background, days } => {
+            compositor_show(background.as_deref(), days, None)
+        }
         #[cfg(feature = "compositor-udev")]
-        CompositorOp::Drm { background, days } => compositor_drm(background.as_deref(), days),
+        CompositorOp::Drm { background, days } => compositor_drm(background.as_deref(), days, None),
     }
 }
 
@@ -1042,7 +1080,7 @@ fn write_ppm(path: &Path, frame: &compositor::RenderedFrame) -> io::Result<()> {
 // window (`take_shell_click`); the Shell maps it through the scene's hit targets
 // (Scene::action_at) to the grant and severs it, exactly as `glass sever` does.
 #[cfg(all(target_os = "linux", feature = "compositor-winit"))]
-fn compositor_show(background: Option<&Path>, days: u64) -> Result<()> {
+fn compositor_show(background: Option<&Path>, days: u64, master: Option<[u8; 32]>) -> Result<()> {
     compositor_ensure_runtime_dir()?;
 
     let mut comp = compositor::Compositor::new().context("start compositor")?;
@@ -1056,7 +1094,8 @@ fn compositor_show(background: Option<&Path>, days: u64) -> Result<()> {
     let (ow, oh) = comp.output_size();
     let mut shell = match background {
         Some(store) => {
-            let (shell, rgba) = Shell::open(store, days, ow as u32, oh as u32, &socket)?;
+            let (shell, rgba) =
+                Shell::open(store, days, ow as u32, oh as u32, &socket, master.as_ref())?;
             comp.set_shell_background(&rgba, ow, oh);
             println!(
                 "compositor: Glass shell background from {} (click `sever` to revoke a \
@@ -1242,6 +1281,7 @@ impl Shell {
         width: u32,
         height: u32,
         wayland_display: &str,
+        key: Option<&[u8; 32]>,
     ) -> Result<(Shell, Vec<u8>)> {
         // The compositor sets XDG_RUNTIME_DIR before opening the shell (its own
         // socket lives under it); the launch path needs it to find that socket on
@@ -1249,7 +1289,10 @@ impl Shell {
         let host_runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .ok_or_else(|| anyhow!("XDG_RUNTIME_DIR is unset"))?;
-        let mut broker = open_broker(store)?;
+        // `key` is the master `horizon boot` already unlocked; with it the shell
+        // opens the store without a passphrase prompt. Standalone `compositor
+        // show/drm --background` pass None and derive from the passphrase.
+        let mut broker = open_broker_with(store, key)?;
         let window = glass::Window::days(now_unix(), days);
         let model = glass::Glass::new(&mut broker).model_within(window, glass::DEFAULT_BUCKETS)?;
         let palette = glass::Palette::new();
@@ -1473,7 +1516,7 @@ impl Shell {
 // monitor it sits at the top-left, the same single-scene limitation the rest of
 // the DRM backend has.
 #[cfg(all(target_os = "linux", feature = "compositor-udev"))]
-fn compositor_drm(background: Option<&Path>, days: u64) -> Result<()> {
+fn compositor_drm(background: Option<&Path>, days: u64, master: Option<[u8; 32]>) -> Result<()> {
     compositor_ensure_runtime_dir()?;
 
     let mut comp = compositor::Compositor::new().context("start compositor")?;
@@ -1488,7 +1531,8 @@ fn compositor_drm(background: Option<&Path>, days: u64) -> Result<()> {
     let (ow, oh) = comp.output_size();
     let mut shell = match background {
         Some(store) => {
-            let (shell, rgba) = Shell::open(store, days, ow as u32, oh as u32, &socket)?;
+            let (shell, rgba) =
+                Shell::open(store, days, ow as u32, oh as u32, &socket, master.as_ref())?;
             comp.set_shell_background(&rgba, ow, oh);
             println!(
                 "compositor: Glass shell background from {} (click `sever` to revoke a \
@@ -1994,6 +2038,109 @@ fn identity_cmd(op: IdentityOp) -> Result<()> {
     Ok(())
 }
 
+// Boot. The seam that joins identity to the experience layer: unlock the store's
+// master once (a FIDO2 touch, a software token, or the passphrase) and launch the
+// desktop on that same master, so a device boots straight into its identity with no
+// second prompt. The unlock and HEAD proof are the cross-platform `boot` crate; the
+// session it hands the master to is the compositor, behind its display backends, so
+// the testable part runs on every host and only the on-screen launch needs hardware.
+fn boot_cmd(
+    store: Option<PathBuf>,
+    root: PathBuf,
+    token: Option<PathBuf>,
+    fido2: bool,
+    days: u64,
+    nested: bool,
+    no_session: bool,
+) -> Result<()> {
+    // The store to boot: the one named, or the single one discovered under root (a
+    // plugged-in Key mounted there). Discovery refuses to guess between several.
+    let store = match store {
+        Some(s) => {
+            if !boot::is_store(&s) {
+                return Err(anyhow!("{} is not a Horizon store", s.display()));
+            }
+            s
+        }
+        None => boot::discover(&root).map_err(|e| anyhow!("{e}"))?,
+    };
+
+    // The device a holder presented, if any. With neither a token nor a security
+    // key, boot is passphrase-only, so we do not build an authenticator (and do not
+    // require one). create=false: boot unlocks an existing token, never mints one.
+    let mut auth = if token.is_some() || fido2 {
+        Some(make_authenticator(token, fido2, false)?)
+    } else {
+        None
+    };
+
+    eprintln!("boot: unlocking {}", store.display());
+    let booted = boot::boot(&store, auth.as_deref_mut(), || {
+        passphrase().map_err(|e| boot::Error::Passphrase(e.to_string()))
+    })
+    .map_err(|e| anyhow!("{e}"))?;
+
+    println!(
+        "boot: unlocked {} with the {}",
+        booted.store.display(),
+        booted.method.label()
+    );
+    println!("boot: {} object(s)", booted.objects);
+    match &booted.head {
+        Some(h) => println!("boot: head {h}"),
+        None => println!("boot: head none (store has no snapshot yet)"),
+    }
+
+    if no_session {
+        println!("boot: --no-session, not launching the desktop");
+        return Ok(());
+    }
+
+    launch_session(&store, days, nested, booted.master)
+}
+
+// Launch the desktop on the already-unlocked master: the bare-metal DRM backend for
+// a real boot, the nested winit backend under --nested for development inside an
+// existing session. The master is threaded through so the session opens the store
+// without re-deriving from the passphrase. Each backend exists only in a build with
+// its feature; a build without it says how to get it instead of failing silently.
+fn launch_session(store: &Path, days: u64, nested: bool, master: [u8; 32]) -> Result<()> {
+    if nested {
+        launch_nested(store, days, master)
+    } else {
+        launch_drm(store, days, master)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "compositor-udev"))]
+fn launch_drm(store: &Path, days: u64, master: [u8; 32]) -> Result<()> {
+    println!("boot: launching the desktop (bare-metal DRM/KMS)");
+    compositor_drm(Some(store), days, Some(master))
+}
+
+#[cfg(not(all(target_os = "linux", feature = "compositor-udev")))]
+fn launch_drm(_store: &Path, _days: u64, _master: [u8; 32]) -> Result<()> {
+    Err(anyhow!(
+        "this build has no bare-metal DRM backend; rebuild with --features \
+         compositor-udev to boot into the desktop, or pass --nested in a build with \
+         --features compositor-winit to nest in an existing session"
+    ))
+}
+
+#[cfg(all(target_os = "linux", feature = "compositor-winit"))]
+fn launch_nested(store: &Path, days: u64, master: [u8; 32]) -> Result<()> {
+    println!("boot: launching the desktop (nested winit session)");
+    compositor_show(Some(store), days, Some(master))
+}
+
+#[cfg(not(all(target_os = "linux", feature = "compositor-winit")))]
+fn launch_nested(_store: &Path, _days: u64, _master: [u8; 32]) -> Result<()> {
+    Err(anyhow!(
+        "this build has no nested (winit) backend; rebuild with --features \
+         compositor-winit"
+    ))
+}
+
 // The store's keyslot file, empty if none has been enrolled yet.
 fn load_keyslots(store: &Path) -> Result<identity::Keyslots> {
     let path = store.join("keyslots");
@@ -2142,7 +2289,20 @@ fn short(g: &GrantId) -> String {
 }
 
 fn open_broker(store: &Path) -> Result<Broker> {
-    Ok(Broker::open(open(store)?, weave::Policy::DenyAll)?)
+    open_broker_with(store, None)
+}
+
+// Open the broker over the store, using an already-unlocked master when one is
+// supplied and deriving it from the passphrase otherwise. `horizon boot` unlocks
+// the master once (a touch, a token, or the passphrase) and hands it to the
+// session it launches, so the desktop opens the same store without a second
+// prompt; the standalone session commands pass None and prompt as before.
+fn open_broker_with(store: &Path, key: Option<&[u8; 32]>) -> Result<Broker> {
+    let ls = match key {
+        Some(k) => Lifestream::open(store, k)?,
+        None => open(store)?,
+    };
+    Ok(Broker::open(ls, weave::Policy::DenyAll)?)
 }
 
 fn parse_resource(s: &str) -> Result<Resource> {
@@ -2204,15 +2364,12 @@ fn random_salt() -> [u8; 16] {
     s
 }
 
-// Argon2id passphrase to master key. The identity crate will extend this with
-// FIDO2 and Shamir recovery; this is the standalone path for the tools.
+// Argon2id passphrase to master key, the single canonical derivation defined in
+// the boot crate so every tool (init, recon, identity, the session) derives a
+// store's master identically; a divergence here would make a store openable one
+// way and not another.
 fn derive(pass: &str, salt: &[u8]) -> [u8; 32] {
-    use argon2::Argon2;
-    let mut key = [0u8; 32];
-    Argon2::default()
-        .hash_password_into(pass.as_bytes(), salt, &mut key)
-        .expect("argon2 derive");
-    key
+    boot::derive(pass, salt)
 }
 
 // The cell a launched palette client runs in: the construction (binds + env) is
@@ -2270,6 +2427,120 @@ mod identity_tests {
         // A token that was never enrolled cannot unlock.
         let mut stranger = SoftwareAuthenticator::new([9u8; 32]);
         assert!(final_slots.unlock_any(&mut stranger).is_err());
+    }
+}
+
+// Boot ties identity to the session: a device unlocks its master once and the
+// desktop opens on that same master. The unlock and proof live in the `boot` crate
+// and are tested there; these tests prove the binary-level integration, that the
+// master a token unlocks really opens the session's store with no passphrase, and
+// that `boot_cmd` runs the whole path through the binary. Cross-platform, so they
+// run in the default suite on every host (the on-screen launch is the only part
+// that needs hardware, eye-verified like the rest of the backend).
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+    use identity::{enroll, Keyslots, SoftwareAuthenticator};
+
+    // Build a store the way the CLI does: a passphrase-derived master, the salt on
+    // disk, and one committed snapshot so HEAD has something the master decrypts.
+    fn make_store(store: &Path, pass: &str) -> [u8; 32] {
+        let salt = random_salt();
+        let master = derive(pass, &salt);
+        let ls = Lifestream::init(store, &master).unwrap();
+        std::fs::write(store.join("keysalt"), salt).unwrap();
+        let content = store.join("content");
+        std::fs::create_dir_all(&content).unwrap();
+        std::fs::write(content.join("note"), b"hello horizon").unwrap();
+        let tree = ls.snapshot_dir(&content).unwrap();
+        ls.commit(tree, vec![], "first").unwrap();
+        master
+    }
+
+    #[test]
+    fn boot_unlocks_with_a_token_and_the_session_opens_on_that_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let master = make_store(&store, "a passphrase nobody types at boot");
+
+        // Enroll a software token as one of the store's keyslots.
+        let mut token = SoftwareAuthenticator::new([7u8; 32]);
+        let mut slots = Keyslots::new();
+        slots.add(enroll(&mut token, &master).unwrap());
+        save_keyslots(&store, &slots).unwrap();
+
+        // Boot with the token, the passphrase fallback wired to panic: a touch
+        // (here a token) recovers the master with no passphrase typed.
+        let booted = boot::boot(&store, Some(&mut token), || {
+            panic!("the passphrase must not be requested when the token unlocks")
+        })
+        .unwrap();
+        assert_eq!(booted.master, master);
+        assert_eq!(booted.method, boot::Method::Keyslot);
+        assert!(booted.head.is_some());
+
+        // The session opens the SAME store on that unlocked master, no passphrase:
+        // this is the threading boot relies on, open_broker_with(Some(master)). It
+        // would prompt for the passphrase if it derived the key itself.
+        let _broker = open_broker_with(&store, Some(&booted.master)).unwrap();
+    }
+
+    #[test]
+    fn boot_cmd_no_session_unlocks_through_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let master = make_store(&store, "passphrase");
+
+        // Enroll a token and write the matching token file the command unlocks with.
+        let mut token = SoftwareAuthenticator::new([3u8; 32]);
+        let mut slots = Keyslots::new();
+        slots.add(enroll(&mut token, &master).unwrap());
+        save_keyslots(&store, &slots).unwrap();
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, [3u8; 32]).unwrap();
+
+        // The whole boot path through the binary: named store, build the token
+        // authenticator, unlock, prove HEAD, then stop before launching a desktop.
+        // No passphrase env is set, so reaching Ok proves the token alone unlocked.
+        boot_cmd(
+            Some(store.clone()),
+            PathBuf::from("."),
+            Some(token_file),
+            false, // fido2
+            7,     // days
+            false, // nested
+            true,  // no_session: the boot check, no desktop
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_passphrase_is_the_fallback_when_no_token_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let pass = "the typed secret";
+        let master = make_store(&store, pass);
+
+        // A store with one enrolled token, and a stranger token that matches no slot.
+        let mut owner = SoftwareAuthenticator::new([1u8; 32]);
+        let mut slots = Keyslots::new();
+        slots.add(enroll(&mut owner, &master).unwrap());
+        save_keyslots(&store, &slots).unwrap();
+        let mut stranger = SoftwareAuthenticator::new([9u8; 32]);
+
+        // The stranger unlocks nothing, so boot falls back to the passphrase and
+        // still reaches the same master.
+        let booted = boot::boot(&store, Some(&mut stranger), || Ok(pass.to_string())).unwrap();
+        assert_eq!(booted.master, master);
+        assert_eq!(booted.method, boot::Method::Passphrase);
+    }
+
+    #[test]
+    fn the_kdf_is_one_definition() {
+        // main's derive delegates to boot::derive: a store made with one opens with
+        // the other. A divergence would lock a store made by `lifestream init`.
+        let salt = b"some-store-salt";
+        assert_eq!(derive("pw", salt), boot::derive("pw", salt));
     }
 }
 

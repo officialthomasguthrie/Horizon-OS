@@ -997,6 +997,39 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   `horizon-init` loading too and failing only at the expected no-HORIZON-BASE-device step, not
   at the loader. Left next: kernel modules and linux-firmware, then dm-verity, LUKS2, the
   bootloader, and the QEMU boot. Built and tested on darwin and in the Linux container.
+- Phase 0 base modules and firmware (`keybuild` crate + `horizon-keybuild`): the immutable base
+  now carries the kernel modules and firmware a machine needs, so it drives real hardware, not
+  just runs a program. `build_base` installs the modules a `KeySpec` names, each at its path
+  under `/lib/modules/<version>` together with its `modules.dep` dependency closure, plus the
+  named firmware blobs at `/lib/firmware`; both are empty by default, so a skeleton-only or
+  userland-only base stays the reproducible squashfs it was and the existing tests are untouched.
+  The closure is the `modules.dep` closure, the module analog of the ldd closure: `parse_modules_dep`
+  reads a `modules.dep` into a map from each module's path to the modules it depends on, and
+  `module_closure` resolves a set of requested names to files (matching each file's canonical name,
+  with `.ko` and any compression suffix stripped and dashes and underscores interchangeable, the way
+  the kernel's module tools do) and walks the graph for the transitive closure, so a driver and
+  everything it loads land together; a requested name that no module matches is an error, not a
+  silent omission. `populate_modules` copies each module in the closure to its own path under the
+  base and writes a `modules.dep` describing exactly that closure, deterministic so the populated
+  base stays reproducible; `populate_firmware` copies each named blob to the same path under
+  `/lib/firmware`, following symlinks, failing on a blob the source lacks rather than shipping a gap.
+  Both are plain filesystem work with no kernel tool, so unlike the userland's `ldd`/`ldconfig` they
+  run and are tested on every host. On the usual split the pure and filesystem parts test everywhere:
+  `parse_modules_dep`, `module_closure` (the transitive closure, unrelated modules excluded, name
+  normalization, the error on an unknown module), the emitted `modules.dep` round-tripping and being
+  deterministic, and `populate_modules`/`populate_firmware` against synthesized trees (the closure
+  copied and the unrelated module left out, the emitted dep consistent and reproducible, a missing
+  firmware failing). The part that needs a kernel is proven for real in the container: a base built
+  with synthesized modules and a firmware blob is mounted and the closure, the emitted `modules.dep`,
+  and the blob are read back through the read-only squashfs, proving they are placed right and survive
+  the round-trip on the format the Key uses. `horizon-keybuild` gains `--kver`, `--module`,
+  `--modules-root`, `--firmware`, and `--firmware-root`; verified end to end through the binary in the
+  container (a base built with the flags holds `ext4.ko` and its closure but not an unrelated module,
+  the emitted `modules.dep`, and the firmware blob, all timestamp-pinned and root-owned). The binary
+  module index (`modules.dep.bin`) the kernel's module autoloader prefers is a `depmod` pass that
+  lands with the real kernel toolchain (this container has no kmod); this text `modules.dep` is what
+  that pass consumes. Left next: dm-verity over the base, LUKS2, the bootloader, and the QEMU boot.
+  Built and tested on darwin and in the Linux container.
 
 ## Next
 
@@ -1130,7 +1163,7 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   Linux for the real key and the desktop; the keyslot core, the secret-sharing core,
   the boot unlock core, and the CLI are cross-platform.
 - Phase 0 proper: the actual bootable artifact this orchestration slots into, the real
-  "boots anywhere and remembers" demo. Four steps are done. The init (the `init` crate +
+  "boots anywhere and remembers" demo. Five steps are done. The init (the `init` crate +
   `horizon-init`): the generic initramfs init that assembles the immutable-base +
   writable-overlay root (Home device or Ghost tmpfs), carries the Key's store into the
   new root, and switch_roots into `horizon boot`, with the policy pure and tested
@@ -1148,9 +1181,13 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   `--bin horizon --bin horizon-init` carries the binaries the init execs and the libraries and
   loader they need; proven in the container by exec'ing a populated binary inside a chroot of
   the mounted squashfs base, and end to end by running the real `horizon` (`--version`, exit 0)
-  from such a base.
-  What is left, in order: populate the base with kernel modules and linux-firmware so it drives
-  real hardware; dm-verity over the base so the immutable layer is
+  from such a base. And the base modules and firmware: `build_base` installs the kernel modules a
+  spec names, each under `/lib/modules/<version>` with its `modules.dep` dependency closure
+  (`module_closure`, the module analog of the ldd closure), plus the named firmware blobs at
+  `/lib/firmware`, so the base drives hardware; the closure and placement are plain filesystem
+  work proven on every host and through the real squashfs in the container, with the binary
+  module index (`modules.dep.bin`) a `depmod` pass for the real kernel toolchain.
+  What is left, in order: dm-verity over the base so the immutable layer is
   tamper-evident (a pure-Rust hash tree cross-checked against `veritysetup format`, the
   kernel open eye-verified by booting since this container's kernel lacks
   CONFIG_DM_VERITY); LUKS2 for the Home writable layer and the Ghost read-only store

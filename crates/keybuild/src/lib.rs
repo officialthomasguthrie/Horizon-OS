@@ -8,14 +8,16 @@
 //! command line, and init finds the partitions by those labels and parses that command
 //! line, so the two agree by sharing `init`'s types rather than by convention.
 //!
-//! This piece builds the immutable base: [`build_base`] materializes a minimal base
-//! skeleton (the standard mount directories and an os-release) and packs it into a
-//! reproducible squashfs, so the same inputs yield byte-identical bytes and the base
-//! can be verified by hash. The build shells out to `mksquashfs`, doing no kernel work
-//! itself, so the crate builds and the pure parts test on every host; only the test
-//! that mounts the result back (as the init's overlay lower) needs a Linux kernel and
-//! is gated, run for real in a privileged container. Populating the base with the real
-//! userland (binaries, libraries, kernel modules, firmware), the persistent data
+//! [`build_base`] materializes a minimal base skeleton (the standard mount directories
+//! and an os-release) and, when a spec names userland binaries, populates the real
+//! userland: each binary at `/usr/bin/<name>` together with its shared-library closure
+//! ([`ldd_closure`]) and an `ld.so.cache`, so the base actually runs a program. It then
+//! packs the tree into a reproducible squashfs, so the same inputs yield byte-identical
+//! bytes and the base can be verified by hash. The build shells out to `mksquashfs` (and
+//! `ldd`/`ldconfig` when populating), doing no kernel work itself, so the crate builds
+//! and the pure parts ([`parse_ldd`], the install-path mapping) test on every host;
+//! only the tests that mount and run the result need a Linux kernel and are gated, run
+//! for real in a privileged container. Kernel modules and firmware, the persistent data
 //! partition, and the bootloader come next.
 
 mod error;
@@ -53,6 +55,10 @@ pub struct KeySpec {
     pub os_name: String,
     pub os_id: String,
     pub os_version: String,
+    /// Host binaries to install into the base's `/usr/bin`, each with its shared-library
+    /// closure. Empty builds a skeleton-only base (the reproducible default the pure
+    /// tests use); naming `horizon` and `horizon-init` here is what makes the base boot.
+    pub userland: Vec<PathBuf>,
 }
 
 impl KeySpec {
@@ -71,6 +77,7 @@ impl KeySpec {
             os_name: "Horizon OS".to_string(),
             os_id: "horizon".to_string(),
             os_version: env!("CARGO_PKG_VERSION").to_string(),
+            userland: Vec::new(),
         }
     }
 }
@@ -135,6 +142,12 @@ pub fn build_base(spec: &KeySpec) -> Result<PathBuf> {
     }
     materialize(&base_skeleton(spec), &staging)?;
 
+    // Populate the real userland (the binaries plus their shared-library closure) when
+    // the spec names any; an empty userland leaves the reproducible skeleton untouched.
+    if !spec.userland.is_empty() {
+        populate_userland(&staging, &spec.userland)?;
+    }
+
     let out = spec.out.join(BASE_IMAGE);
     if out.exists() {
         std::fs::remove_file(&out)?;
@@ -191,6 +204,135 @@ fn materialize(skeleton: &Skeleton, staging: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Parse `ldd` stdout into the absolute paths of the shared objects a binary loads:
+/// every `soname => /path` resolution and the bare `/path` interpreter line, dropping
+/// the kernel's virtual DSO (linux-vdso / linux-gate) and any unresolved entry. The
+/// trailing ` (0x...)` load address ldd prints is stripped, and duplicates are folded.
+/// Pure text handling, so it is unit-tested with sample output on every host while the
+/// [`ldd_closure`] call that produces the text is Linux-only.
+pub fn parse_ldd(output: &str) -> Vec<PathBuf> {
+    let mut libs: Vec<PathBuf> = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.starts_with("linux-vdso") || line.starts_with("linux-gate") {
+            continue;
+        }
+        let path = if let Some((_, rhs)) = line.split_once("=>") {
+            // "libc.so.6 => /lib/.../libc.so.6 (0x...)"; "=> not found" has no path.
+            let rhs = strip_load_address(rhs.trim());
+            if rhs.is_empty() || rhs == "not found" {
+                continue;
+            }
+            rhs
+        } else if line.starts_with('/') {
+            // The interpreter line: "/lib/ld-linux-aarch64.so.1 (0x...)".
+            strip_load_address(line)
+        } else {
+            // "statically linked", a soname header, a blank line: nothing to copy.
+            continue;
+        };
+        let p = PathBuf::from(path);
+        if !libs.contains(&p) {
+            libs.push(p);
+        }
+    }
+    libs
+}
+
+// Drop the trailing " (0x...)" load address ldd prints after a resolved path.
+fn strip_load_address(s: &str) -> &str {
+    match s.rfind(" (0x") {
+        Some(i) => s[..i].trim_end(),
+        None => s.trim(),
+    }
+}
+
+/// The shared-library closure of a dynamically linked binary: every shared object it
+/// transitively needs plus the ELF interpreter, as resolved absolute paths. Shells out
+/// to `ldd`, whose output [`parse_ldd`] reads; a statically linked or non-ELF input has
+/// an empty closure rather than an error. There is no `ldd` on a non-Linux host, so the
+/// populate path that calls this runs in the build container.
+pub fn ldd_closure(bin: &Path) -> Result<Vec<PathBuf>> {
+    let mut cmd = Command::new("ldd");
+    cmd.arg(bin);
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::Missing("ldd")),
+        Err(e) => return Err(Error::Io(e)),
+    };
+    if !out.status.success() {
+        // ldd exits nonzero for a static or non-dynamic ELF; that is an empty closure.
+        let text = String::from_utf8_lossy(&out.stdout);
+        let err = String::from_utf8_lossy(&out.stderr);
+        if text.contains("not a dynamic executable") || err.contains("not a dynamic executable") {
+            return Ok(Vec::new());
+        }
+        return Err(Error::Tool {
+            name: "ldd",
+            code: out.status.code(),
+            stderr: err.trim().to_string(),
+        });
+    }
+    Ok(parse_ldd(&String::from_utf8_lossy(&out.stdout)))
+}
+
+// Where a userland binary is installed inside the base: /usr/bin/<name> (relative to
+// the base root), which is exactly where init's DEFAULT_INIT points, so installing the
+// `horizon` binary here is what makes the pivot's exec target exist.
+fn bin_install_path(bin: &Path) -> Result<PathBuf> {
+    let name = bin
+        .file_name()
+        .ok_or_else(|| Error::NotAFile(bin.to_path_buf()))?;
+    Ok(Path::new("usr/bin").join(name))
+}
+
+/// Install the userland into the staging tree: each binary at /usr/bin/<name>, the
+/// transitive shared-library closure of all of them each at its own absolute path, and
+/// an ld.so.cache so the loader resolves them. The closure is collected across every
+/// binary and deduplicated, so a library shared by two binaries is copied once.
+fn populate_userland(staging: &Path, bins: &[PathBuf]) -> Result<()> {
+    let mut libs: Vec<PathBuf> = Vec::new();
+    for bin in bins {
+        copy_file(bin, &staging.join(bin_install_path(bin)?))?;
+        for lib in ldd_closure(bin)? {
+            if !libs.contains(&lib) {
+                libs.push(lib);
+            }
+        }
+    }
+    for lib in &libs {
+        // Strip the leading slash so /lib/.../libc.so.6 lands under the base root.
+        let rel = lib.strip_prefix("/").unwrap_or(lib);
+        copy_file(lib, &staging.join(rel))?;
+    }
+    build_ld_so_cache(staging)
+}
+
+// Copy one file into the base, creating parent directories as needed. fs::copy follows
+// symlinks (a versioned .so behind its soname) and preserves the mode bits, so an
+// executable or the loader stays executable; squashfs then pins ownership and
+// timestamps, keeping the base reproducible.
+fn copy_file(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, dst)?;
+    Ok(())
+}
+
+/// Build `/etc/ld.so.cache` inside the staging tree with `ldconfig -r`, so the dynamic
+/// loader finds the copied libraries by soname the way it does on a normal system
+/// rather than leaning on its compiled-in defaults. The cache is a deterministic
+/// function of the libraries present, so the populated base stays reproducible.
+fn build_ld_so_cache(staging: &Path) -> Result<()> {
+    std::fs::create_dir_all(staging.join("etc"))?;
+    let mut cmd = Command::new("ldconfig");
+    cmd.arg("-r")
+        .arg(staging)
+        .stdout(std::process::Stdio::null());
+    run(cmd, "ldconfig")
+}
+
 fn run(mut cmd: Command, name: &'static str) -> Result<()> {
     match cmd.output() {
         Ok(o) if o.status.success() => Ok(()),
@@ -242,6 +384,59 @@ mod tests {
         }
         assert!(sk.os_release.contains("Horizon OS"));
         assert!(sk.os_release.contains("ID=horizon"));
+    }
+
+    #[test]
+    fn parse_ldd_reads_resolved_libraries_and_the_interpreter() {
+        // Real aarch64 ldd output: the kernel vdso, a resolved library, the interpreter.
+        let out = "\tlinux-vdso.so.1 (0x0000ffff82c4f000)\n\
+                   \tlibc.so.6 => /lib/aarch64-linux-gnu/libc.so.6 (0x0000ffff82a20000)\n\
+                   \t/lib/ld-linux-aarch64.so.1 (0x0000ffff82c00000)\n";
+        let libs = parse_ldd(out);
+        assert_eq!(
+            libs,
+            vec![
+                PathBuf::from("/lib/aarch64-linux-gnu/libc.so.6"),
+                PathBuf::from("/lib/ld-linux-aarch64.so.1"),
+            ]
+        );
+        // The kernel's virtual DSO is never a real file, so it is dropped.
+        assert!(!libs.iter().any(|p| p.to_string_lossy().contains("vdso")));
+    }
+
+    #[test]
+    fn parse_ldd_skips_unresolved_and_folds_duplicates() {
+        // An x86-64 shape, a missing library, and the same soname listed twice.
+        let out = "\tlibfoo.so.1 => not found\n\
+                   \tlibm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x00007f00)\n\
+                   \tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f10)\n\
+                   \tlibm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x00007f20)\n\
+                   \t/lib64/ld-linux-x86-64.so.2 (0x00007f30)\n";
+        assert_eq!(
+            parse_ldd(out),
+            vec![
+                PathBuf::from("/lib/x86_64-linux-gnu/libm.so.6"),
+                PathBuf::from("/lib/x86_64-linux-gnu/libc.so.6"),
+                PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_ldd_of_a_static_binary_is_empty() {
+        assert!(parse_ldd("\tstatically linked\n").is_empty());
+        assert!(parse_ldd("").is_empty());
+    }
+
+    #[test]
+    fn a_binary_installs_where_init_execs_it() {
+        // The horizon binary must land at exactly init's DEFAULT_INIT, so the pivot's
+        // exec target exists in the base no matter what host path it was built at.
+        let rel = bin_install_path(Path::new("target/release/horizon")).unwrap();
+        assert_eq!(rel, PathBuf::from("usr/bin/horizon"));
+        assert_eq!(Path::new("/").join(&rel), Path::new(init::DEFAULT_INIT));
+        // A path with no filename is rejected rather than silently misplaced.
+        assert!(bin_install_path(Path::new("/")).is_err());
     }
 }
 
@@ -389,6 +584,77 @@ mod linux_tests {
         umount(&l.lower);
         umount(&scratch);
         losetup_d(&loopdev);
+    }
+
+    // A base populated with a real userland actually runs it: build a base holding a
+    // dynamic host binary and its ldd closure, mount the squashfs, and exec the binary
+    // inside a chroot of the base. If any library or the loader were missing or
+    // misplaced, the dynamic loader would fail, so this proves the closure is complete
+    // and correctly placed on the real image, the part parse_ldd's unit tests cannot.
+    #[test]
+    fn a_populated_base_runs_its_userland_under_chroot() {
+        let dir = tempfile::tempdir().unwrap();
+        // A small, ubiquitous dynamic binary whose closure is just libc and the loader.
+        let probe = Path::new("/bin/cat");
+        if !probe.exists() {
+            eprintln!("skipping: no /bin/cat to populate");
+            return;
+        }
+        let mut spec = KeySpec::new(dir.path());
+        spec.userland = vec![probe.to_path_buf()];
+        let base = match build_base(&spec) {
+            Ok(p) => p,
+            Err(Error::Missing(t)) => {
+                eprintln!("skipping: {t} not installed");
+                return;
+            }
+            Err(e) => panic!("build populated base: {e}"),
+        };
+
+        let Some(loopdev) = losetup(&base, true) else {
+            eprintln!("skipping: losetup not permitted here");
+            return;
+        };
+        let mnt = dir.path().join("mnt");
+        std::fs::create_dir_all(&mnt).unwrap();
+        if let Err(e) = execute(&Plan {
+            steps: vec![Step::Mount {
+                source: Source::new(loopdev.as_str(), "squashfs", MountFlags::default())
+                    .read_only(),
+                target: mnt.clone(),
+            }],
+        }) {
+            losetup_d(&loopdev);
+            if is_unprivileged_error(&e) {
+                eprintln!("skipping: mounting not permitted here ({e})");
+                return;
+            }
+            panic!("mount base: {e}");
+        }
+
+        // The populated cat reads the skeleton's os-release from inside the chrooted
+        // base: the binary, its libc, the loader, and the cache all have to resolve.
+        let out = Command::new("chroot")
+            .arg(&mnt)
+            .args(["/usr/bin/cat", "/etc/os-release"])
+            .output();
+        umount(&mnt);
+        losetup_d(&loopdev);
+        let out = out.expect("spawn chroot");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if !out.status.success() {
+            // chroot needs CAP_SYS_CHROOT; skip where it is not permitted (CI).
+            if stderr.contains("Operation not permitted") || stderr.contains("superuser") {
+                eprintln!("skipping: chroot not permitted here ({stderr})");
+                return;
+            }
+            panic!("chroot run failed (code {:?}): {stderr}", out.status.code());
+        }
+        assert!(
+            stdout.contains("Horizon OS"),
+            "the populated cat must read the base os-release, got: {stdout:?}"
+        );
     }
 
     // The keystone: a complete Key (a real squashfs base, a real ext4 data partition,

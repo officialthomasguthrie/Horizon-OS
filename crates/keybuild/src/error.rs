@@ -1,9 +1,13 @@
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// A userland binary path has no final component to install under /usr/bin.
+    #[error("not a file: {0}")]
+    NotAFile(PathBuf),
     /// A build tool ran but failed. The name and its stderr are what a build log needs.
     #[error("{name} failed (exit {code:?}): {stderr}")]
     Tool {

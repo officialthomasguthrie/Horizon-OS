@@ -824,6 +824,52 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   identity wiring: hooking `identity unlock` into the real boot/init sequence, and a
   phone as a post-boot trusted device. Built and tested on darwin and in the Linux
   container.
+- Phase 0/5 boot integration (`boot` crate + `horizon`): the seam that joins identity
+  to the experience layer, so a device unlocks its master once and lands in its
+  desktop on that same master, instead of unlocking and then being asked for the
+  passphrase again. The honest gap it closes: `identity unlock` recovered the master
+  with a touch but only printed status, while every session path (`compositor
+  show/drm --background`) re-derived the master from the passphrase through
+  `open_broker` -> `open` -> `master_key`, so the unlock and the session never met. A
+  new cross-platform `boot` crate models the boot unlock as three pure steps over a
+  store on disk: `discover` finds the one store to boot (the store itself, or the
+  single store under a mount, by the `keysalt` marker every tool checks; zero or many
+  is an error, never a guess at which identity to open), `unlock` recovers the master
+  trying an enrolled keyslot through a present authenticator first (a FIDO2 touch or a
+  software token, reusing `identity`) and falling back to the passphrase, and `prove`
+  opens the Lifestream and decrypts HEAD, the same proof `identity unlock` and
+  `reconstitute open` use, so a wrong key fails before any session starts; `boot` runs
+  all three and returns a `Booted` (the store, the proven master, how it was
+  unlocked). The passphrase KDF is lifted into `boot::derive` as the single canonical
+  Argon2id derivation every tool now shares (`horizon`'s `derive` delegates to it, and
+  its `argon2` dep is dropped), so a store made by `lifestream init` opens the way
+  `boot` opens it with no second definition to drift. `horizon boot [--store <s> |
+  --root <mount>] [--token <f> | --fido2] [--nested] [--no-session]` ties it together:
+  it resolves the store, builds the authenticator if asked, runs `boot::boot`, prints
+  the boot log, and launches the desktop in-process on the unlocked master, threaded
+  through a new `open_broker_with(store, Some(master))` so the session opens the store
+  with no second prompt (the standalone `compositor show/drm` pass None and derive
+  from the passphrase as before). The desktop is the bare-metal DRM backend for a real
+  boot, the nested winit backend under `--nested` for development; each exists only in
+  a build with its compositor feature, and a build without it says how to get it
+  rather than failing silently. On the usual headless split the whole unlock-and-prove
+  core is pure logic over a store on disk, tested with no hardware: 9 `boot` unit tests
+  (store detection, discovery including refuse-to-guess and the ambiguous case, the
+  KDF, the keyslot-then-passphrase policy against a `SoftwareAuthenticator`, the HEAD
+  proof, a wrong master rejected) and 4 `horizon` integration tests (a token unlocks
+  the master and the session opens on it with no passphrase, the whole path runs
+  through `boot_cmd --no-session`, the passphrase is the fallback when no token
+  matches, and main's KDF agrees with `boot::derive`), all cross-platform so they run
+  on darwin and in the container. The one part that needs hardware is launching the
+  actual desktop on a screen, eye-verified next exactly as the compositor backends
+  are; `--no-session` is the boot check that runs anywhere. Also verified end to end
+  through the binary: init and snapshot a store, enroll a software token, then `horizon
+  boot` unlocks it with the token and no passphrase (HEAD decrypts), discovers the same
+  store under a mount, falls back to the passphrase with no token, and a wrong token
+  falls back and is refused by the HEAD proof. Left for the boot wiring: a phone as a
+  post-boot trusted device (a Constellation enrollment after boot), and the real
+  initramfs/UEFI image Phase 0 proper builds this orchestration into. Built and tested
+  on darwin and in the Linux container.
 
 ## Next
 
@@ -943,7 +989,15 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   and seals it for a fresh device), and `unlock` is the unlock path itself (try the
   keyslots, fall back to the passphrase), all headless-tested with the software token
   and verified through the binary; the real key is compile-checked in CI and
-  hardware-verified next. What is left is the boot integration proper: hooking
-  `identity unlock` into the real boot/init sequence (so a device boots into its
-  identity with a touch), and a phone as a post-boot trusted device. Linux for the
-  real key; the keyslot core, the secret-sharing core, and the CLI are cross-platform.
+  hardware-verified next. The boot integration core is now done too: a cross-platform
+  `boot` crate (discover the store, unlock the master by keyslot-then-passphrase, prove
+  HEAD) and `horizon boot`, which unlocks once and launches the desktop in-process on
+  that master (threaded through `open_broker_with` so the session never re-prompts),
+  with `--no-session` as the boot check that runs anywhere; the unlock-and-prove core
+  is headless-tested (9 boot + 4 horizon tests) and verified through the binary, and
+  the canonical Argon2id KDF now lives once in `boot::derive`. What is left is the
+  on-hardware part: eye-verifying a real device boots into its desktop with a touch
+  (the DRM session launch), a phone as a post-boot trusted device (a Constellation
+  enrollment after boot), and Phase 0 proper (the initramfs/UEFI image this
+  orchestration slots into). Linux for the real key and the desktop; the keyslot core,
+  the secret-sharing core, the boot unlock core, and the CLI are cross-platform.

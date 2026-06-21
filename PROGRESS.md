@@ -966,6 +966,37 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   or mounting is not permitted and tears its loop devices and mounts down on every path.
   Left next: populating the base with the real userland, dm-verity, LUKS2, the bootloader,
   and the QEMU boot. Built and tested on darwin and in the Linux container.
+- Phase 0 base userland (`keybuild` crate + `horizon-keybuild`): the immutable base now
+  carries the real userland, so it boots a machine instead of being an empty skeleton.
+  `build_base` installs the binaries a `KeySpec` names, each at `/usr/bin/<name>` with its
+  shared-library closure, so a base built `--bin horizon --bin horizon-init` holds the
+  binaries the init execs and the libraries and loader they need; the userland is empty by
+  default, so a skeleton-only base stays the reproducible squashfs it was and the existing
+  tests are untouched. The closure is the ldd closure: `ldd_closure` shells out to `ldd` and
+  `parse_ldd` reads its output into the resolved absolute paths of every shared object a
+  binary loads plus the ELF interpreter, dropping the kernel's virtual DSO (linux-vdso /
+  linux-gate) and any unresolved entry. `populate_userland` copies each binary and the
+  deduplicated closure of all of them into the staging tree, each library at its own absolute
+  path (so the interpreter baked into the ELF still resolves), then builds an `ld.so.cache`
+  with `ldconfig -r` so the loader finds them by soname rather than leaning on its compiled-in
+  defaults; `fs::copy` follows a versioned `.so` behind its soname and preserves the mode bits,
+  and the cache is a deterministic function of the libraries present, so the populated base
+  stays reproducible and squashfs pins ownership and timestamps as before. On the usual split
+  the pure parts test on every host: `parse_ldd` against sample aarch64 and x86-64 ldd output
+  (resolved libraries, the interpreter, a missing entry, duplicates folded, a static binary
+  empty) and that a binary installs at exactly init's `DEFAULT_INIT` (`/usr/bin/horizon`) so
+  the pivot's exec target exists; the part that needs a kernel is proven for real in the
+  container, where a base populated with a dynamic host binary and its closure is mounted and
+  the binary is exec'd inside a chroot of the base, which fails if any library or the loader is
+  missing or misplaced, the one thing the parse test cannot show. `horizon-keybuild` gains a
+  repeatable `--bin` to name the binaries to install. Verified end to end through the binary in
+  the container: `horizon-keybuild --out --bin .../horizon --bin .../horizon-init` builds a
+  base whose squashfs holds both binaries, libc, the loader, and a timestamp-pinned
+  `ld.so.cache`, and the real `horizon` binary runs from inside a chroot of the mounted base
+  (`horizon --version` prints, exit 0) loading its libc and loader from the base, with
+  `horizon-init` loading too and failing only at the expected no-HORIZON-BASE-device step, not
+  at the loader. Left next: kernel modules and linux-firmware, then dm-verity, LUKS2, the
+  bootloader, and the QEMU boot. Built and tested on darwin and in the Linux container.
 
 ## Next
 
@@ -1099,7 +1130,7 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   Linux for the real key and the desktop; the keyslot core, the secret-sharing core,
   the boot unlock core, and the CLI are cross-platform.
 - Phase 0 proper: the actual bootable artifact this orchestration slots into, the real
-  "boots anywhere and remembers" demo. Three steps are done. The init (the `init` crate +
+  "boots anywhere and remembers" demo. Four steps are done. The init (the `init` crate +
   `horizon-init`): the generic initramfs init that assembles the immutable-base +
   writable-overlay root (Home device or Ghost tmpfs), carries the Key's store into the
   new root, and switch_roots into `horizon boot`, with the policy pure and tested
@@ -1112,10 +1143,14 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   initializes an identity store on the data partition, assembles the overlay root through
   init's Home-mode plan, and proves `boot::boot` opens the identity with an enrolled token
   on the real squashfs + ext4 formats, short of the switch_root that needs an actual boot.
-  What is left, in order: populate the base with the real userland (the horizon +
-  horizon-init binaries and their shared libraries, then kernel modules and
-  linux-firmware) so the base actually boots a machine; dm-verity over the base so the
-  immutable layer is
+  And the base userland: `build_base` installs the binaries a spec names, each at
+  `/usr/bin/<name>` with its ldd shared-library closure and an `ld.so.cache`, so a base built
+  `--bin horizon --bin horizon-init` carries the binaries the init execs and the libraries and
+  loader they need; proven in the container by exec'ing a populated binary inside a chroot of
+  the mounted squashfs base, and end to end by running the real `horizon` (`--version`, exit 0)
+  from such a base.
+  What is left, in order: populate the base with kernel modules and linux-firmware so it drives
+  real hardware; dm-verity over the base so the immutable layer is
   tamper-evident (a pure-Rust hash tree cross-checked against `veritysetup format`, the
   kernel open eye-verified by booting since this container's kernel lacks
   CONFIG_DM_VERITY); LUKS2 for the Home writable layer and the Ghost read-only store

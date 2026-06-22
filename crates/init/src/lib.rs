@@ -35,7 +35,7 @@ pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{execute, is_unprivileged_error, mount_proc, resolve};
+pub use linux::{execute, is_unprivileged_error, luks_close, luks_open, mount_proc, resolve};
 
 use std::path::{Path, PathBuf};
 
@@ -44,10 +44,18 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_INIT: &str = "/usr/bin/horizon";
 
 /// The filesystem labels a Horizon Key carries: the rendezvous between the image
-/// builder, which writes them onto the base and data partitions, and this init,
-/// which finds those partitions by label so no device path is ever hardcoded.
+/// builder, which writes them onto the partitions, and this init, which finds those
+/// partitions by label so no device path is ever hardcoded.
+///
+/// A Key has three: the immutable base, the plain data partition holding the identity
+/// store (readable before unlock, because its confidentiality is the Lifestream's own
+/// object encryption), and the LUKS2-encrypted Home layer holding the writable overlay
+/// backing (opened with the master the store yields). Splitting the store off the
+/// encrypted layer is what breaks the circularity: the store is read to recover the
+/// master before the layer that master unlocks is opened.
 pub const BASE_LABEL: &str = "HORIZON-BASE";
 pub const DATA_LABEL: &str = "HORIZON-DATA";
+pub const HOME_LABEL: &str = "HORIZON-HOME";
 
 /// Where the new root is assembled and where the Key's identity store is bound, both
 /// under the initramfs's own tmpfs. The store path is what `horizon boot --root` is
@@ -387,8 +395,14 @@ impl ModeChoice {
 pub struct Params {
     pub base: Spec,
     pub basefs: String,
+    /// The plain data partition holding the identity store.
     pub data: Spec,
     pub datafs: String,
+    /// The LUKS2-encrypted Home layer backing the writable overlay. Opened with the
+    /// master in Home mode; untouched in Ghost mode.
+    pub home: Spec,
+    /// The filesystem inside the Home layer, mounted once the LUKS volume is open.
+    pub homefs: String,
     pub mode: ModeChoice,
     pub init: PathBuf,
     pub init_args: Vec<String>,
@@ -401,6 +415,8 @@ impl Default for Params {
             basefs: "squashfs".into(),
             data: Spec::Label(DATA_LABEL.into()),
             datafs: "ext4".into(),
+            home: Spec::Label(HOME_LABEL.into()),
+            homefs: "ext4".into(),
             mode: ModeChoice::Auto,
             init: PathBuf::from(DEFAULT_INIT),
             init_args: vec!["boot".into()],
@@ -410,8 +426,8 @@ impl Default for Params {
 
 /// Parse the kernel command line into [`Params`]. Recognized tokens, all optional:
 /// `horizon.base=`, `horizon.basefs=`, `horizon.data=`, `horizon.datafs=`,
-/// `horizon.mode=home|ghost|auto`, `horizon.init=`. Anything else (the kernel's own
-/// arguments) is ignored.
+/// `horizon.home=`, `horizon.homefs=`, `horizon.mode=home|ghost|auto`, `horizon.init=`.
+/// Anything else (the kernel's own arguments) is ignored.
 pub fn parse_cmdline(cmdline: &str) -> Params {
     let mut p = Params::default();
     for tok in cmdline.split_whitespace() {
@@ -423,6 +439,10 @@ pub fn parse_cmdline(cmdline: &str) -> Params {
             p.data = Spec::parse(v);
         } else if let Some(v) = tok.strip_prefix("horizon.datafs=") {
             p.datafs = v.to_string();
+        } else if let Some(v) = tok.strip_prefix("horizon.home=") {
+            p.home = Spec::parse(v);
+        } else if let Some(v) = tok.strip_prefix("horizon.homefs=") {
+            p.homefs = v.to_string();
         } else if let Some(v) = tok.strip_prefix("horizon.mode=") {
             p.mode = ModeChoice::parse(v);
         } else if let Some(v) = tok.strip_prefix("horizon.init=") {
@@ -442,6 +462,41 @@ pub fn choose_mode(choice: ModeChoice, data: Option<Source>) -> Mode {
         (ModeChoice::Ghost, _) | (_, None) => Mode::Ghost,
         (_, Some(d)) => Mode::Home(d),
     }
+}
+
+/// The raw master key length cryptsetup reads from stdin when opening the Home layer.
+/// Fixed at 32 bytes (`--keyfile-size`) so a master containing a newline byte is not
+/// truncated, the same handling keybuild's formatter uses.
+pub const MASTER_KEY_SIZE: usize = 32;
+
+/// The device-mapper name the opened Home layer is exposed under, `/dev/mapper/<this>`.
+/// One fixed name: a boot opens exactly one Home layer.
+pub const HOME_MAPPER: &str = "horizon-home";
+
+/// The cryptsetup argv (after the program name) to open the encrypted Home layer at
+/// `container`, reading the 32-byte master from stdin, exposing it at
+/// `/dev/mapper/<mapper>`. Pure, so it is asserted with no cryptsetup; the inverse of the
+/// keybuild formatter's key handling, so the master that formatted the layer opens it.
+pub fn luks_open_args(container: &Path, mapper: &str) -> Vec<String> {
+    vec![
+        "luksOpen".into(),
+        "--key-file".into(),
+        "-".into(),
+        "--keyfile-size".into(),
+        MASTER_KEY_SIZE.to_string(),
+        container.to_string_lossy().into_owned(),
+        mapper.into(),
+    ]
+}
+
+/// The cryptsetup argv to close the device-mapper node `mapper`.
+pub fn luks_close_args(mapper: &str) -> Vec<String> {
+    vec!["luksClose".into(), mapper.into()]
+}
+
+/// The path the kernel exposes an opened LUKS volume at.
+pub fn mapper_path(mapper: &str) -> PathBuf {
+    Path::new("/dev/mapper").join(mapper)
 }
 
 #[cfg(test)]
@@ -644,10 +699,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_cmdline_reads_the_home_layer() {
+        let p = parse_cmdline("horizon.home=LABEL=ENC horizon.homefs=btrfs");
+        assert_eq!(p.home, Spec::Label("ENC".into()));
+        assert_eq!(p.homefs, "btrfs");
+    }
+
+    #[test]
     fn parse_cmdline_defaults_to_the_horizon_labels() {
         let p = parse_cmdline("ro quiet console=tty0");
         assert_eq!(p.base, Spec::Label("HORIZON-BASE".into()));
         assert_eq!(p.data, Spec::Label("HORIZON-DATA".into()));
+        // The encrypted Home layer defaults to its own label, so a Key boots with no
+        // explicit command line.
+        assert_eq!(p.home, Spec::Label("HORIZON-HOME".into()));
+        assert_eq!(p.homefs, "ext4");
         assert_eq!(p.mode, ModeChoice::Auto);
         assert_eq!(p.init, PathBuf::from(DEFAULT_INIT));
         assert_eq!(p.init_args, ["boot"]);
@@ -658,6 +724,24 @@ mod tests {
         assert_eq!(Spec::parse("LABEL=X"), Spec::Label("X".into()));
         assert_eq!(Spec::parse("UUID=1234"), Spec::Uuid("1234".into()));
         assert_eq!(Spec::parse("/dev/sda2"), Spec::Path("/dev/sda2".into()));
+    }
+
+    #[test]
+    fn luks_open_args_read_an_exact_32_byte_key_from_stdin() {
+        let args = luks_open_args(Path::new("/dev/disk/by-label/HORIZON-HOME"), HOME_MAPPER);
+        assert_eq!(args[0], "luksOpen");
+        let pos = |s: &str| args.iter().position(|a| a == s).unwrap();
+        // The master comes from stdin, exactly 32 bytes, never a key file on disk.
+        assert_eq!(args[pos("--key-file") + 1], "-");
+        assert_eq!(args[pos("--keyfile-size") + 1], "32");
+        // The container then the mapper name are the trailing positional args.
+        assert_eq!(args[args.len() - 2], "/dev/disk/by-label/HORIZON-HOME");
+        assert_eq!(args[args.len() - 1], "horizon-home");
+        assert_eq!(luks_close_args("m"), vec!["luksClose", "m"]);
+        assert_eq!(
+            mapper_path("horizon-home"),
+            Path::new("/dev/mapper/horizon-home")
+        );
     }
 
     #[test]

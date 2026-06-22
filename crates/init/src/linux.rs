@@ -4,14 +4,19 @@
 // lib.rs.
 
 use std::ffi::CString;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use nix::errno::Errno;
 use nix::mount::{mount, MsFlags};
 use nix::unistd::{chdir, chroot, execv};
 
-use crate::{Error, MountFlags, Plan, Source, Spec, Step};
+use crate::{
+    luks_close_args, luks_open_args, mapper_path, Error, MountFlags, Plan, Source, Spec, Step,
+    MASTER_KEY_SIZE,
+};
 
 // A typed None for the source/fstype/data arguments mount does not need.
 const NONE: Option<&Path> = None;
@@ -176,6 +181,82 @@ pub fn resolve(spec: &Spec, fstype: &str) -> Result<Source, Error> {
         return Err(Error::Resolve(format!("{spec:?}")));
     }
     Ok(Source::new(path, fstype, MountFlags::default()))
+}
+
+/// Open the encrypted Home layer at `container` with the 32-byte `master`, exposing the
+/// decrypted volume at `/dev/mapper/<mapper>`, and return that path. The master is fed to
+/// cryptsetup on stdin (exactly [`MASTER_KEY_SIZE`] bytes), so it never lands in a key
+/// file or an argument; a wrong master, or device-mapper being unavailable, fails here.
+/// This is the boot-time consumer of what keybuild's formatter wrote: the init recovers
+/// the master from the store, opens this layer with it, then assembles the overlay over
+/// the decrypted device.
+pub fn luks_open(
+    container: &Path,
+    mapper: &str,
+    master: &[u8; MASTER_KEY_SIZE],
+) -> Result<PathBuf, Error> {
+    cryptsetup_with_key(
+        "luksOpen",
+        container,
+        &luks_open_args(container, mapper),
+        master,
+    )?;
+    Ok(mapper_path(mapper))
+}
+
+/// Close the device-mapper node `mapper` (tear down the decrypted mapping). Paired with
+/// [`luks_open`] so a teardown path never leaves the layer open.
+pub fn luks_close(mapper: &str) -> Result<(), Error> {
+    let out = Command::new("cryptsetup")
+        .args(luks_close_args(mapper))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| Error::step("luksClose", Path::new(mapper), e))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(Error::step(
+            "luksClose",
+            Path::new(mapper),
+            tool_error(&out.stderr),
+        ))
+    }
+}
+
+// Run a cryptsetup command that reads the master from stdin and check its exit. Writing
+// the key to the child's stdin and closing the pipe is what keeps the master off disk and
+// out of the process arguments; cryptsetup reads exactly MASTER_KEY_SIZE bytes.
+fn cryptsetup_with_key(
+    op: &'static str,
+    at: &Path,
+    args: &[String],
+    master: &[u8; MASTER_KEY_SIZE],
+) -> Result<(), Error> {
+    let mut child = Command::new("cryptsetup")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::step(op, at, e))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(master);
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| Error::step(op, at, e))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(Error::step(op, at, tool_error(&out.stderr)))
+    }
+}
+
+// A cryptsetup failure (a wrong key, device-mapper unavailable) as an io::Error carrying
+// its stderr, so the boot log says why the layer would not open.
+fn tool_error(stderr: &[u8]) -> std::io::Error {
+    std::io::Error::other(String::from_utf8_lossy(stderr).trim().to_string())
 }
 
 /// Whether an error is the host refusing a privileged operation (mount and friends),

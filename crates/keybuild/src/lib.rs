@@ -43,8 +43,11 @@ pub mod luks;
 pub mod verity;
 
 pub use error::{Error, Result};
-pub use luks::HOME_LABEL;
 pub use verity::{Verity, VerityParams};
+// The HORIZON-HOME label is part of the build/boot contract, so it lives in `init`
+// alongside the base and data labels and is re-exported here, shared by type rather than
+// duplicated. build_home writes it on the Home layer's inner filesystem.
+pub use init::HOME_LABEL;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1289,6 +1292,216 @@ mod linux_tests {
         assert!(std::fs::read_to_string(l.root.join("etc/os-release"))
             .unwrap()
             .contains("Horizon OS"));
+
+        cleanup();
+    }
+
+    // The encrypted keystone: a complete Home Surface boots into its identity on the real
+    // formats, with the writable layer encrypted. Build a squashfs base, a plain ext4 data
+    // partition for the identity store, and a LUKS2 Home layer keyed by the master; init the
+    // store on the data partition; then assemble exactly as a Home boot does, mount the base
+    // read-only as the overlay lower, mount the data partition, recover the master from the
+    // store with an enrolled token (boot::unlock), open the Home layer with that master
+    // (init::luks_open), and overlay the decrypted layer over the base. This proves the
+    // master the store yields unlocks the encrypted writable layer and a write lands in that
+    // encrypted upper, not the immutable base, all on the real squashfs + ext4 + LUKS2
+    // formats keybuild produced, short of the switch_root that needs an actual boot. Skips
+    // where a build tool or device-mapper is unavailable, and tears every mount, loop device,
+    // and mapping down on each path.
+    #[test]
+    fn an_encrypted_home_assembles_and_boot_opens_its_identity() {
+        use boot::{boot as boot_device, derive, unlock, Method};
+        use identity::{enroll, Keyslots, SoftwareAuthenticator};
+        use init::{
+            execute, is_unprivileged_error, luks_close, luks_open, Layout, MountFlags, Plan,
+            Source, Step, HOME_MAPPER,
+        };
+        use lifestream::Lifestream;
+
+        const PASS: &str = "correct horse battery staple";
+        const SALT: &[u8] = b"horizon-encrypted-keystone-salt!";
+        const SEED: [u8; 32] = [11u8; 32];
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = KeySpec::new(dir.path());
+        spec.home_size_mb = 48;
+        let master = derive(PASS, SALT);
+
+        // The three filesystems of an encrypted Key, skipping if a build tool is absent.
+        let Some(base) = build_or_skip(dir.path()) else {
+            return;
+        };
+        let data = match build_data(&spec) {
+            Ok(p) => p,
+            Err(Error::Missing(_)) => {
+                eprintln!("skipping: mkfs.ext4 not installed");
+                return;
+            }
+            Err(e) => panic!("build data: {e}"),
+        };
+        let home = match build_home(&spec, &master) {
+            Ok(p) => p,
+            Err(Error::Missing(t)) => {
+                eprintln!("skipping: {t} not installed");
+                return;
+            }
+            Err(e) if is_dm_unavailable(&e) => {
+                eprintln!("skipping: device-mapper not permitted here ({e})");
+                return;
+            }
+            Err(e) => panic!("build home: {e}"),
+        };
+
+        // The base read-only and the store partition writable, as a Home boot sees the Key;
+        // the Home layer is opened from its file directly (cryptsetup makes its own loop).
+        let Some(base_loop) = losetup(&base, true) else {
+            eprintln!("skipping: losetup not permitted here");
+            return;
+        };
+        let Some(data_loop) = losetup(&data, false) else {
+            losetup_d(&base_loop);
+            eprintln!("skipping: losetup not permitted here");
+            return;
+        };
+
+        let scratch = dir.path().join("run");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let l = Layout::new(&scratch);
+        let data_mnt = scratch.join("data");
+        let store = data_mnt.join("store");
+        let booted_store = l.root.join("run/horizon/store");
+
+        let cleanup = || {
+            umount(&booted_store);
+            umount(&l.root);
+            umount(&l.over);
+            let _ = luks_close(HOME_MAPPER);
+            umount(&data_mnt);
+            umount(&l.lower);
+            umount(&scratch);
+            losetup_d(&data_loop);
+            losetup_d(&base_loop);
+        };
+
+        // A private tmpfs scratch, the base as the read-only lower, the data partition
+        // mounted so the identity store can be read before the encrypted layer is opened.
+        let setup = Plan {
+            steps: vec![
+                Step::Mount {
+                    source: Source::tmpfs(),
+                    target: scratch.clone(),
+                },
+                Step::Mkdir(l.lower.clone()),
+                Step::Mount {
+                    source: Source::new(base_loop.as_str(), "squashfs", MountFlags::default())
+                        .read_only(),
+                    target: l.lower.clone(),
+                },
+                Step::Mkdir(data_mnt.clone()),
+                Step::Mount {
+                    source: Source::new(data_loop.as_str(), "ext4", MountFlags::default()),
+                    target: data_mnt.clone(),
+                },
+            ],
+        };
+        if let Err(e) = execute(&setup) {
+            cleanup();
+            if is_unprivileged_error(&e) {
+                eprintln!("skipping: mounting not permitted here ({e})");
+                return;
+            }
+            panic!("mount Key: {e}");
+        }
+
+        // Initialize the identity store on the data partition: the master derived from the
+        // passphrase and salt (the same master the Home layer is keyed by), a HEAD to prove,
+        // and an enrolled token (the touch-to-boot path).
+        std::fs::create_dir_all(&store).unwrap();
+        let ls = Lifestream::init(&store, &master).unwrap();
+        std::fs::write(store.join("keysalt"), SALT).unwrap();
+        let seed = dir.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::write(seed.join("hello"), b"horizon").unwrap();
+        let tree = ls.snapshot_dir(&seed).unwrap();
+        ls.commit(tree, vec![], "first").unwrap();
+        let mut auth = SoftwareAuthenticator::new(SEED);
+        let mut slots = Keyslots::new();
+        slots.add(enroll(&mut auth, &master).unwrap());
+        std::fs::write(store.join("keyslots"), slots.encode()).unwrap();
+        drop(ls);
+
+        // Recover the master from the store with the token, exactly as the init does in the
+        // initramfs, and open the encrypted Home layer with it.
+        let mut token = SoftwareAuthenticator::new(SEED);
+        let (recovered, method) = unlock(&store, Some(&mut token), || {
+            panic!("the token must unlock the master without a passphrase")
+        })
+        .unwrap();
+        assert_eq!(method, Method::Keyslot);
+        assert_eq!(recovered, master);
+        let mapper = match luks_open(&home, HOME_MAPPER, &recovered) {
+            Ok(d) => d,
+            Err(e) => {
+                cleanup();
+                panic!("the recovered master must open the Home layer: {e}");
+            }
+        };
+
+        // Overlay the decrypted Home layer over the immutable base and carry the store in.
+        let assemble = Plan {
+            steps: vec![
+                Step::Mkdir(l.over.clone()),
+                Step::Mount {
+                    source: Source::new(mapper.clone(), "ext4", MountFlags::default()),
+                    target: l.over.clone(),
+                },
+                Step::Mkdir(l.upper.clone()),
+                Step::Mkdir(l.work.clone()),
+                Step::Mkdir(l.root.clone()),
+                Step::Overlay {
+                    lower: l.lower.clone(),
+                    upper: l.upper.clone(),
+                    work: l.work.clone(),
+                    target: l.root.clone(),
+                },
+                Step::Mkdir(booted_store.clone()),
+                Step::Bind {
+                    from: store.clone(),
+                    to: booted_store.clone(),
+                },
+            ],
+        };
+        if let Err(e) = execute(&assemble) {
+            cleanup();
+            panic!("assemble encrypted root: {e}");
+        }
+
+        // A write to the root lands in the encrypted upper (on the LUKS layer), never in the
+        // immutable base: persistent state is encrypted at rest.
+        std::fs::write(l.root.join("session-state"), b"remembered").unwrap();
+        assert!(
+            l.upper.join("session-state").exists(),
+            "the write must land in the encrypted upper"
+        );
+        assert!(std::fs::read_to_string(l.root.join("etc/os-release"))
+            .unwrap()
+            .contains("Horizon OS"));
+
+        // boot opens the carried identity on the recovered master, the same proof the plain
+        // keystone makes, now over the encrypted writable layer.
+        let mut token2 = SoftwareAuthenticator::new(SEED);
+        let booted = match boot_device(&booted_store, Some(&mut token2), || {
+            panic!("the passphrase must not be requested when the token unlocks")
+        }) {
+            Ok(b) => b,
+            Err(e) => {
+                cleanup();
+                panic!("boot opens the identity: {e}");
+            }
+        };
+        assert_eq!(booted.master, master);
+        assert_eq!(booted.method, Method::Keyslot);
+        assert!(booted.head.is_some());
 
         cleanup();
     }

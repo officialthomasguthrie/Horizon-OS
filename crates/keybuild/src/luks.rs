@@ -49,11 +49,6 @@ use crate::{Error, Result};
 /// all 32 bytes regardless of content.
 pub const MASTER_KEY_SIZE: usize = 32;
 
-/// The label written on the ext4 filesystem inside the LUKS2 container, and the label
-/// the encrypted writable partition itself carries on a real Key, so the init finds it
-/// the way it finds the base and the store: by label, no device path hardcoded.
-pub const HOME_LABEL: &str = "HORIZON-HOME";
-
 /// The cryptsetup argv (after the program name) to format `container` as a LUKS2 volume
 /// keyed by a 32-byte master read from stdin. Pure, so it is asserted with no cryptsetup:
 ///

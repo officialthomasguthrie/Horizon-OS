@@ -1188,6 +1188,45 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   bootloader (shim -> systemd-boot/GRUB -> kernel + initramfs), the loader config carrying the boot command
   line and the dm-verity root hash, and init's own `dm-verity` open; then the QEMU boot. Built and tested on
   darwin and in the Linux container, with the GPT cross-check also in CI.
+- Phase 0 FAT EFI System Partition (`keybuild` crate + `horizon-keybuild`): the one partition UEFI firmware
+  reads directly is now built and laid on the Key disk, continuing step (4) after the GPT assembly. The Key's
+  other partitions are squashfs, ext4, and LUKS, which the kernel mounts but firmware does not understand;
+  the partition firmware reads to find the bootloader (and where the kernel and initramfs live) is the ESP,
+  and the ESP is FAT. A new `keybuild::fat` owns a minimal FAT16/FAT32 writer in pure Rust: the boot sector
+  (BIOS Parameter Block), the FSInfo and backup boot sector FAT32 adds, two FAT copies, the fixed root-
+  directory region FAT16 uses and the root cluster chain FAT32 uses instead, 8.3 short-name directory
+  entries, and the cluster-chain allocation that lays files and subdirectories into the data region. It owns
+  the format for the same reasons `verity` and `gpt` do and the inverse of `luks`: the container has no
+  `mkfs.fat`/`mtools`, the layout is a deterministic function of the contents so a Key is reproducible (fixed
+  timestamps, a label-derived volume id like `gpt` derives its GUIDs) and builds on any host, and the fiddly-
+  but-not-secret format is pure logic tested everywhere; `luks` shelled out only because LUKS2's format is
+  complex and security-critical and its kernel consumer was present to test against, exactly the verity
+  situation inverted. The FAT type is chosen by volume size, FAT32 at or above 64 MiB (the firmware-friendly
+  default a real ESP uses) and FAT16 below (a small test volume), always keeping the cluster count inside the
+  chosen type's Microsoft range so firmware that keys off the count agrees with the BPB written, and never
+  landing on FAT12; `format` asserts the count matches the declared type rather than emitting a mismatched
+  one. Scope is deliberately minimal: 512-byte sectors, two FATs, 8.3 uppercase names, files and
+  subdirectories, no VFAT long-name entries yet (the removable bootloader path `/EFI/BOOT/BOOTX64.EFI` and
+  8.3-friendly kernel/initramfs names fit; LFN is a refinement for a loader that needs a long name).
+  `build_esp` lays the default `/EFI/BOOT` skeleton and `build_esp_with` takes a populated tree for the
+  bootloader step; `build_disk` now lays the ESP as partition one (the conventional place, carrying the EFI
+  System Partition type GUID so firmware recognizes it) ahead of the base, data, and Home partitions (the
+  generic Linux type, resolved by label), with a new `KeySpec.esp_size_mb` (default 128 MiB, room for the
+  kernel, initramfs, and bootloader). On the usual headless split the whole format is pure and unit-tested on
+  every host (the geometry and type selection landing in range, the boot-sector signature and BPB fields for
+  both types, the reserved FAT entries, a directory tree round-tripping through an independent in-test FAT
+  reader for both FAT16 and FAT32, reproducibility, contents-too-large refused, and bad 8.3 names rejected),
+  and the proof it is byte-correct is the kernel itself: a gated container test loop-mounts the self-built
+  ESP as `vfat` and reads its files back for both a FAT16 and a FAT32 volume (the analog of the GPT `sgdisk`
+  cross-check and verity's `veritysetup` cross-check), and the disk-offset test now attaches the ESP at its
+  GPT offset and confirms `blkid` finds a `vfat` filesystem there. `horizon-keybuild --esp` builds the ESP
+  and `--disk` includes it. Verified end to end through the binary in the container: `--esp` writes a 128 MiB
+  FAT ESP that mounts as `vfat` (label HORIZON-ESP, the `/EFI/BOOT` skeleton navigable), and `--disk` writes
+  a 451 MiB `key.img` whose four partitions `sgdisk -v` accepts with no problems, the ESP partition one with
+  type code EF00. Left next, to finish step (4): the bootloader proper (shim -> systemd-boot/GRUB -> kernel +
+  initramfs) written into this ESP, the loader config carrying the boot command line and the dm-verity root
+  hash, and init's own `dm-verity` open over the base; then the QEMU boot. Refinement still owed: VFAT long
+  names for a loader that needs them. Built and tested on darwin and in the Linux container.
 
 ## Next
 
@@ -1375,11 +1414,20 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   data, and Home images side by side into a bootable `key.img` as the HORIZON-BASE/DATA/HOME partitions
   init resolves by label, proven by a pure unit suite, an `sgdisk` table cross-check (in CI and the
   container), and a container test that attaches each partition at its GPT offset and confirms the right
-  filesystem is there.
-  What is left, to finish step (4): the ESP partition (a FAT filesystem holding the bootloader, kernel, and
-  initramfs) added to the disk, the isohybrid UEFI/BIOS bootloader itself (shim -> systemd-boot/GRUB ->
-  kernel + initramfs), the loader config carrying the boot command line and the dm-verity root hash, and
-  init's own `dm-verity` open (it opens dm-crypt for the Home layer but not yet dm-verity over the base);
+  filesystem is there. And the FAT EFI System Partition, the one partition firmware reads directly:
+  `keybuild::fat` owns a minimal FAT16/FAT32 writer in pure Rust (the BPB, FAT32's FSInfo and backup boot
+  sector, two FATs, FAT16's fixed root region and FAT32's root cluster chain, 8.3 directory entries, cluster
+  allocation) for the same reasons gpt and verity own their formats (no `mkfs.fat` in the container,
+  deterministic and reproducible, fiddly but not secret), choosing the type by size (FAT32 for a real ESP,
+  FAT16 for a small one) within the Microsoft cluster-count thresholds so it never lands on FAT12;
+  `build_esp` lays the `/EFI/BOOT` skeleton and `build_disk` puts the ESP at partition one with the EFI
+  System Partition type GUID, proven by a pure suite (round-tripping a tree through an in-test FAT reader for
+  both types) and a container test that loop-mounts the self-built ESP as `vfat` and reads its files back,
+  the kernel's own FAT driver the cross-check.
+  What is left, to finish step (4): the isohybrid UEFI/BIOS bootloader itself (shim -> systemd-boot/GRUB ->
+  kernel + initramfs) written into the ESP, the loader config carrying the boot command line and the
+  dm-verity root hash, and init's own `dm-verity` open (it opens dm-crypt for the Home layer but not yet
+  dm-verity over the base);
   and finally (5) booting the whole chain in QEMU (UEFI -> bootloader -> kernel ->
   horizon-init -> horizon boot -> the DRM desktop on virtio-gpu), where the init's boot orchestration
   and the dm-verity/dm-crypt kernel opens get their eye-verification. Refinements that ride along with

@@ -1148,6 +1148,46 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   minimal initramfs. This completes Phase 0 step (3): the encrypted Home writable layer and the Ghost
   read-only store handoff, produced by keybuild and booted by init. Built and tested on darwin and in the
   Linux container (the binary's boot orchestration eye-verified at the QEMU boot).
+- Phase 0 GPT disk assembly (`keybuild` crate + `horizon-keybuild`): the partition images keybuild builds
+  separately are now laid side by side under one GUID Partition Table, the bootable disk a kernel and a
+  bootloader are written onto and the start of Phase 0 step (4). Until now keybuild emitted `base.squashfs`,
+  `data.img`, and `home.img` as loose files; a real disk needs them framed by a partition table so firmware
+  and the kernel find them. A new `keybuild::gpt` owns the GPT format in pure Rust: GUID parse and encode
+  (mixed-endian, the classic GPT footgun, pinned by a known-answer test), CRC-32 (computed directly, no new
+  dependency, pinned to the canonical 0xCBF43926 check value), the LBA-0 protective MBR, the primary and
+  backup GPT headers, the 128-entry partition array, and the layout math (partitions placed at 1 MiB
+  boundaries, sized up to a whole alignment unit so they start and end aligned and sit contiguously). It owns
+  the format for the same reasons verity does, the inverse of luks: no `sgdisk`/`sfdisk` exists in the build
+  container, the table is a deterministic function of the partition sizes and the caller's GUIDs so it is
+  reproducible (the disk and per-partition GUIDs are derived from the names) and builds on any host, and the
+  security-irrelevant-but-fiddly format is pure logic tested everywhere; luks shelled out because LUKS2's
+  format is genuinely complex and security-critical and its kernel consumer was present to test against, while
+  GPT is simple and well-specified and its tool was absent, exactly the verity situation. `write_disk` is the
+  tool-free IO layer (it sizes each partition from its image, calls `gpt::build`, creates the disk file,
+  streams each image to its offset so a 256 MiB layer is never read whole, writes the primary and backup
+  structures, and returns each partition's `Placement` so a later step knows where the ESP is); `build_disk`
+  assembles a Key's three filesystems as the HORIZON-BASE/HORIZON-DATA/HORIZON-HOME partitions, named by the
+  same labels init resolves by (the PARTLABELs equal the filesystem labels, one source of truth) and all
+  carrying the generic Linux-filesystem type GUID since Horizon tells its partitions apart by label, not type.
+  `horizon-keybuild --disk` builds the data and Home partitions too (so it needs `--home-keyfile`) and writes
+  `key.img`. On the usual headless split the whole format is pure and unit-tested on every host (the CRC and
+  GUID known-answers, the header fields and their CRCs, the backup header mirroring the primary with the
+  LBAs swapped, the 1 MiB alignment and contiguity, a partition entry's type and UTF-16 name, and
+  determinism), and the result is cross-checked two independent ways where there is a kernel and the tools:
+  a gated test assembles a disk from tiny stand-in images and has `sgdisk` verify the table clean and report
+  the right partitions, type codes, and alignment (file-only, so it runs in CI with `gdisk` installed and in
+  the container), and a container test builds a real base + data + Home, assembles the disk, and attaches
+  each partition at the offset the GPT points to, confirming `blkid` finds a squashfs, a labeled ext4, and a
+  LUKS2 container there. Partitions are attached by byte offset rather than a `losetup -P` partition scan
+  because this container has no udev to create the per-partition device nodes, the same by-label/udev gap a
+  minimal initramfs has and a refinement still owed to the boot bring-up. Verified end to end through the
+  binary in the container: `horizon-keybuild --disk` writes a 323 MiB `key.img` whose three partitions
+  `sgdisk -v` accepts with no problems, each at its aligned offset. The ESP (the FAT partition holding the
+  bootloader, kernel, and initramfs) is the next partition to add; `write_disk` already takes an extensible
+  partition list and returns placements, so it slots in. Left next, to finish step (4): that ESP and the
+  bootloader (shim -> systemd-boot/GRUB -> kernel + initramfs), the loader config carrying the boot command
+  line and the dm-verity root hash, and init's own `dm-verity` open; then the QEMU boot. Built and tested on
+  darwin and in the Linux container, with the GPT cross-check also in CI.
 
 ## Next
 
@@ -1327,10 +1367,20 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   is wired to the three-partition layout, a Home boot mounts the store partition, recovers the master,
   opens the Home layer and assembles over it, and a Ghost boot mounts the store read-only and carries
   it (the Foreign-Surface handoff), the binary's orchestration eye-verified at the QEMU boot. That
-  finishes Phase 0 step (3).
-  What is left, in order: the isohybrid UEFI/BIOS bootloader (shim -> systemd-boot/GRUB -> kernel +
-  initramfs) into a bootable Key image, wiring the verity root hash and the encrypted-layer unlock
-  into the boot chain; and finally booting the whole chain in QEMU (UEFI -> bootloader -> kernel ->
+  finishes Phase 0 step (3). And the GPT disk assembly, the start of step (4): `keybuild::gpt` owns the
+  GUID Partition Table in pure Rust (protective MBR, primary and backup headers, the 128-entry array,
+  CRC-32, mixed-endian GUIDs, 1 MiB-aligned contiguous partitions) for the same reasons verity owns its
+  format and luks does not (no `sgdisk` in the container, the table is deterministic and reproducible, the
+  format is fiddly but not security-critical), and `build_disk` / `horizon-keybuild --disk` lay the base,
+  data, and Home images side by side into a bootable `key.img` as the HORIZON-BASE/DATA/HOME partitions
+  init resolves by label, proven by a pure unit suite, an `sgdisk` table cross-check (in CI and the
+  container), and a container test that attaches each partition at its GPT offset and confirms the right
+  filesystem is there.
+  What is left, to finish step (4): the ESP partition (a FAT filesystem holding the bootloader, kernel, and
+  initramfs) added to the disk, the isohybrid UEFI/BIOS bootloader itself (shim -> systemd-boot/GRUB ->
+  kernel + initramfs), the loader config carrying the boot command line and the dm-verity root hash, and
+  init's own `dm-verity` open (it opens dm-crypt for the Home layer but not yet dm-verity over the base);
+  and finally (5) booting the whole chain in QEMU (UEFI -> bootloader -> kernel ->
   horizon-init -> horizon boot -> the DRM desktop on virtio-gpu), where the init's boot orchestration
   and the dm-verity/dm-crypt kernel opens get their eye-verification. Refinements that ride along with
   the boot bring-up: a FIDO2 key at the initramfs (touch-to-boot, not only a console passphrase),

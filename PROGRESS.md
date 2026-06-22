@@ -1122,6 +1122,32 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   binary to do this at real boot (mount the store partition, recover the master through a present
   authenticator or a console passphrase, luksOpen, assemble) plus the Ghost read-only store handoff,
   eye-verified by booting. Built and tested on darwin and in the Linux container.
+- Phase 0 init boots the encrypted layout (`init` crate, Linux): the `horizon-init` binary now boots the
+  three-partition encrypted Key, the consumer wiring around the boot-time open the encrypted keystone
+  proved. It brings up the kernel filesystems first (so the Key's partitions appear under `/dev`),
+  resolves the base, the plain data (store) partition, and the LUKS2 Home layer, and decides the mode with
+  the pure `home_wanted` (encrypted Home needs the store, the Home layer, and a non-Ghost request; anything
+  else runs stateless, the same "boots anywhere" degradation `choose_mode` applies to a missing data
+  device). A Home boot mounts the store partition read-write, discovers the identity store on it
+  (`boot::discover`), recovers the master from it (`boot::unlock`), opens the Home layer with that master
+  (`init::luks_open`), and assembles the overlay over the decrypted layer; the master is fed to cryptsetup
+  on stdin and never written to disk. The Ghost read-only store handoff closes the Foreign-Surface gap the
+  init noted before: Ghost now mounts the store partition read-only and carries the store into the new
+  root, so a Foreign Surface boots into the identity (read-only) without writing anything to the Key,
+  where before it carried no store at all. The store is carried in both modes and `horizon boot` is
+  pointed at it. The init now depends on `boot` (Linux-only, for discover + unlock) and gained an
+  `Error::Boot` variant for identity failures surfaced on the console. On the usual split the policy is
+  pure and unit-tested (`home_wanted`, the `horizon.home`/`horizon.homefs` cmdline tokens) while the
+  binary's mount/recover/luksOpen/switch_root orchestration is compile-checked and clippy-clean and
+  eye-verified at the QEMU boot, exactly as the switch_root executor is; the library mechanism it drives
+  (recover the master, luksOpen, overlay over the decrypted layer) is already proven by the encrypted
+  keystone. Left as refinements for the boot bring-up: a FIDO2 key at the initramfs (the touch-to-boot
+  path, identity's `HardwareKey` behind the `fido2` feature, instead of only the console passphrase),
+  handing the recovered master to `horizon boot` so the session does not unlock a second time after the
+  pivot, echo-off on the passphrase prompt, and the udev (or UUID) path so by-label resolution works in a
+  minimal initramfs. This completes Phase 0 step (3): the encrypted Home writable layer and the Ghost
+  read-only store handoff, produced by keybuild and booted by init. Built and tested on darwin and in the
+  Linux container (the binary's boot orchestration eye-verified at the QEMU boot).
 
 ## Next
 
@@ -1294,14 +1320,22 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   gated container round-trip (format, open with the master, mount the inner ext4, refuse a wrong
   master) and end to end through `horizon-keybuild --home`. The store stays on a plain readable
   partition (its confidentiality is the Lifestream's own object encryption), which is what lets
-  the master be recovered before the layer it unlocks is opened.
-  What is left, in order: the boot-time consumer of that encrypted layer, the init recovering the
-  master in the initramfs (reusing `boot`'s discover + unlock) and `luksOpen`-ing the Home layer
-  before it assembles the overlay, plus the Ghost read-only store handoff (mount the store
-  read-only off a Foreign Surface so nothing is written to it); the isohybrid UEFI/BIOS
-  bootloader (shim -> systemd-boot/GRUB -> kernel + initramfs) into a bootable Key
-  image; and finally booting the whole chain in QEMU (UEFI -> bootloader -> kernel ->
-  horizon-init -> horizon boot -> the DRM desktop on virtio-gpu). Environment notes for
+  the master be recovered before the layer it unlocks is opened. And the boot-time consumer of that
+  layer: `init::luks_open` opens the Home layer at boot, proven by an encrypted keystone (build base
+  + data + home, recover the master from the store with a token, open the layer, overlay over it, a
+  write lands in the encrypted upper, `boot::boot` opens the identity); and the `horizon-init` binary
+  is wired to the three-partition layout, a Home boot mounts the store partition, recovers the master,
+  opens the Home layer and assembles over it, and a Ghost boot mounts the store read-only and carries
+  it (the Foreign-Surface handoff), the binary's orchestration eye-verified at the QEMU boot. That
+  finishes Phase 0 step (3).
+  What is left, in order: the isohybrid UEFI/BIOS bootloader (shim -> systemd-boot/GRUB -> kernel +
+  initramfs) into a bootable Key image, wiring the verity root hash and the encrypted-layer unlock
+  into the boot chain; and finally booting the whole chain in QEMU (UEFI -> bootloader -> kernel ->
+  horizon-init -> horizon boot -> the DRM desktop on virtio-gpu), where the init's boot orchestration
+  and the dm-verity/dm-crypt kernel opens get their eye-verification. Refinements that ride along with
+  the boot bring-up: a FIDO2 key at the initramfs (touch-to-boot, not only a console passphrase),
+  handing the master from init to horizon boot so the session does not unlock twice, and udev (or
+  UUID) resolution so by-label finds the partitions in a minimal initramfs. Environment notes for
   that last stretch: this build container is aarch64 with no KVM, so a shippable x86-64
   Key needs cross-compilation (the `x86_64-unknown-linux-gnu` target plus a kernel,
   busybox, and libs) and QEMU runs in TCG; an aarch64 image booted with

@@ -39,10 +39,12 @@
 //! byte-for-byte. The bootloader comes next.
 
 mod error;
+pub mod gpt;
 pub mod luks;
 pub mod verity;
 
 pub use error::{Error, Result};
+pub use gpt::Guid;
 pub use verity::{Verity, VerityParams};
 // The HORIZON-HOME label is part of the build/boot contract, so it lives in `init`
 // alongside the base and data labels and is re-exported here, shared by type rather than
@@ -68,6 +70,10 @@ pub const VERITY_IMAGE: &str = "base.verity";
 /// The encrypted Home writable layer's filename under a spec's output directory: a LUKS2
 /// container holding the OverlayFS upper, keyed by the identity master.
 pub const HOME_IMAGE: &str = "home.img";
+
+/// The assembled bootable disk's filename: a GPT image with the base, data, and Home
+/// partitions laid side by side, the artifact a bootloader and a kernel are written onto.
+pub const DISK_IMAGE: &str = "key.img";
 
 /// The parameters of a Key to build: where to write it, the partition labels and
 /// filesystems init looks for, the default boot mode, and how the system names itself.
@@ -350,6 +356,115 @@ pub fn build_verity(spec: &KeySpec) -> Result<VerityArtifact> {
         data_blocks: v.data_blocks,
         levels: v.levels,
     })
+}
+
+/// A partition to place on the assembled disk: the image file that fills it, its GPT type
+/// GUID, and its partition name (the PARTLABEL). [`write_disk`] reads each image's size,
+/// lays the partitions out under a GPT, and copies the images into place.
+#[derive(Debug, Clone)]
+pub struct DiskPart {
+    pub image: PathBuf,
+    pub type_guid: gpt::Guid,
+    pub name: String,
+}
+
+/// Where a partition landed on the assembled disk: its name and the byte offset and length
+/// of its region. [`write_disk`] returns one per partition, in order, so a later step (such
+/// as writing a bootloader into the ESP) knows where each partition begins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    pub name: String,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// Assemble `parts` into a GPT disk image at `out`. Reads each partition image's size,
+/// computes the table with [`gpt::build`] (the disk and partition GUIDs derived from the
+/// names, so the table is reproducible), creates the disk file sized to hold everything,
+/// streams each image into its partition offset, and writes the primary and backup GPT
+/// structures. Returns each partition's [`Placement`] on the disk. Tool-free, plain file IO
+/// over images already built, so it runs and is testable on any host; a gated test
+/// cross-checks the result against `sgdisk` and a container test attaches each partition by
+/// its returned offset to confirm the right filesystem landed there.
+pub fn write_disk(out: &Path, parts: &[DiskPart]) -> Result<Vec<Placement>> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    // Size every partition from its image, failing if one has not been built yet.
+    let mut specs = Vec::with_capacity(parts.len());
+    for p in parts {
+        let size = match std::fs::metadata(&p.image) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::NoImage(p.image.clone()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        specs.push(gpt::PartSpec {
+            type_guid: p.type_guid,
+            unique_guid: gpt::Guid::derive(&p.name),
+            name: p.name.clone(),
+            size,
+        });
+    }
+
+    let disk = gpt::build(gpt::Guid::derive("horizon-key-disk"), &specs);
+
+    // A fresh file sized to the whole disk; the gaps between partitions stay sparse zeros.
+    if out.exists() {
+        std::fs::remove_file(out)?;
+    }
+    let mut f = std::fs::File::create(out)?;
+    f.set_len(disk.total_bytes)?;
+
+    // The GPT structures (front at offset 0, backup at the tail), then each partition image
+    // streamed to its offset so a large image is never read whole into memory.
+    f.write_all(&disk.front)?;
+    f.seek(SeekFrom::Start(disk.back_offset))?;
+    f.write_all(&disk.back)?;
+    let mut placements = Vec::with_capacity(parts.len());
+    for (p, placed) in parts.iter().zip(&disk.parts) {
+        let mut src = std::fs::File::open(&p.image)?;
+        f.seek(SeekFrom::Start(placed.offset))?;
+        std::io::copy(&mut src, &mut f)?;
+        placements.push(Placement {
+            name: p.name.clone(),
+            offset: placed.offset,
+            size: placed.size,
+        });
+    }
+    f.flush()?;
+    Ok(placements)
+}
+
+/// Assemble a Key's filesystems into a bootable GPT disk at `<out>/key.img`: the immutable
+/// base, the plain data store, and the encrypted Home layer, written as the HORIZON-BASE,
+/// HORIZON-DATA, and HORIZON-HOME partitions the init resolves by label. Each must already
+/// be built ([`build_base`], [`build_data`], [`build_home`]); a missing image is an error.
+/// The ESP holding the bootloader, kernel, and initramfs is added as a fourth partition
+/// once those exist. All three carry the generic Linux filesystem type GUID; they are told
+/// apart by their labels, not their types.
+pub fn build_disk(spec: &KeySpec) -> Result<PathBuf> {
+    let linux = gpt::Guid::parse(gpt::LINUX_FS_TYPE).expect("static type guid parses");
+    let parts = [
+        DiskPart {
+            image: spec.out.join(BASE_IMAGE),
+            type_guid: linux,
+            name: spec.base_label.clone(),
+        },
+        DiskPart {
+            image: spec.out.join(DATA_IMAGE),
+            type_guid: linux,
+            name: spec.data_label.clone(),
+        },
+        DiskPart {
+            image: spec.out.join(HOME_IMAGE),
+            type_guid: linux,
+            name: HOME_LABEL.to_string(),
+        },
+    ];
+    let out = spec.out.join(DISK_IMAGE);
+    write_disk(&out, &parts)?;
+    Ok(out)
 }
 
 fn materialize(skeleton: &Skeleton, staging: &Path) -> Result<()> {
@@ -920,6 +1035,85 @@ mod tests {
             populate_firmware(staging.path(), src.path(), &["missing.bin".to_string()]).is_err()
         );
     }
+
+    // A stand-in partition image of `mib` megabytes (zeros), enough for `write_disk` to size
+    // and place a partition without a real filesystem or any build tool.
+    fn stub(dir: &Path, name: &str, mib: u64) -> DiskPart {
+        let img = dir.join(format!("{name}.img"));
+        let f = std::fs::File::create(&img).unwrap();
+        f.set_len(mib * 1024 * 1024).unwrap();
+        let type_guid = if name == "HORIZON-ESP" {
+            gpt::Guid::parse(gpt::ESP_TYPE).unwrap()
+        } else {
+            gpt::Guid::parse(gpt::LINUX_FS_TYPE).unwrap()
+        };
+        DiskPart {
+            image: img,
+            type_guid,
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn assembled_disk_round_trips_through_sgdisk() {
+        // Assemble a disk from tiny stand-in images (no build tools, no device-mapper) and
+        // have a reference GPT tool read the table back: it must verify clean and report the
+        // partitions with the right names, type codes, and 1 MiB alignment. This is the
+        // byte-exact proof of the table, the way the verity tests cross-check veritysetup.
+        // Skips where sgdisk is absent (a bare host, darwin) and runs in CI and the
+        // container.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let parts = [
+            stub(dir.path(), "HORIZON-ESP", 3),
+            stub(dir.path(), "HORIZON-BASE", 5),
+            stub(dir.path(), "HORIZON-DATA", 4),
+            stub(dir.path(), "HORIZON-HOME", 7),
+        ];
+        let disk = dir.path().join("key.img");
+        let placed = write_disk(&disk, &parts).unwrap();
+        // The first partition sits at 1 MiB; the placements are returned in order.
+        assert_eq!(placed[0].offset, gpt::ALIGN_SECTORS * gpt::SECTOR);
+        assert_eq!(placed.iter().map(|p| &p.name).collect::<Vec<_>>().len(), 4);
+
+        let verify = match Command::new("sgdisk").arg("-v").arg(&disk).output() {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping: sgdisk not installed");
+                return;
+            }
+            Err(e) => panic!("sgdisk: {e}"),
+        };
+        let vout = String::from_utf8_lossy(&verify.stdout);
+        assert!(verify.status.success(), "sgdisk -v failed: {vout}");
+        assert!(
+            vout.contains("No problems found"),
+            "sgdisk found problems: {vout}"
+        );
+
+        let print = Command::new("sgdisk")
+            .arg("-p")
+            .arg(&disk)
+            .output()
+            .unwrap();
+        let pout = String::from_utf8_lossy(&print.stdout);
+        for name in [
+            "HORIZON-ESP",
+            "HORIZON-BASE",
+            "HORIZON-DATA",
+            "HORIZON-HOME",
+        ] {
+            assert!(pout.contains(name), "sgdisk -p missing {name}:\n{pout}");
+        }
+        // EF00 is the ESP type code, 8300 the Linux filesystem one, derived from our GUIDs.
+        assert!(pout.contains("EF00"), "missing ESP type code:\n{pout}");
+        assert!(pout.contains("8300"), "missing Linux fs type code:\n{pout}");
+        // The first partition is reported starting at the 1 MiB-aligned sector 2048.
+        assert!(
+            pout.contains("2048"),
+            "first partition not 1 MiB-aligned:\n{pout}"
+        );
+    }
 }
 
 // Mounting the built base back, as the init's overlay lower, needs a Linux kernel, so
@@ -954,6 +1148,44 @@ mod linux_tests {
 
     fn umount(p: &Path) {
         let _ = Command::new("umount").arg("-l").arg(p).output();
+    }
+
+    // Attach one GPT partition (a sub-region of the whole disk image) to a read-only loop
+    // device by its byte offset and length. This is how a partition is read without udev
+    // creating the per-partition nodes a `losetup -P` partition scan would need (this
+    // container has no udev, the same gap a minimal initramfs has), and it doubles as proof
+    // that the right filesystem really landed at the offset the GPT points to.
+    fn losetup_off(file: &Path, offset: u64, size: u64) -> Option<String> {
+        let out = Command::new("losetup")
+            .args([
+                "-r",
+                "-o",
+                &offset.to_string(),
+                "--sizelimit",
+                &size.to_string(),
+                "--find",
+                "--show",
+            ])
+            .arg(file)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!dev.is_empty()).then_some(dev)
+    }
+
+    // `-c /dev/null` probes the device fresh instead of trusting blkid's on-disk cache,
+    // which keys on the device name: losetup reuses the same loop node across partitions, so
+    // a cached probe would report the previous partition's filesystem.
+    fn blkid(dev: &str) -> String {
+        Command::new("blkid")
+            .args(["-c", "/dev/null"])
+            .arg(dev)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
     }
 
     // Build a base, skipping if mksquashfs is not installed (CI) rather than failing.
@@ -1835,5 +2067,96 @@ mod linux_tests {
         };
         assert_eq!(artifact.root_hex(), theirs_root);
         assert_bytes_eq(&our_bytes, &theirs_bytes);
+    }
+
+    #[test]
+    fn build_disk_places_each_filesystem_at_its_gpt_offset() {
+        // Assemble a real Key (squashfs base, ext4 data store, LUKS2 Home layer) into a GPT
+        // disk, then attach each partition at the offset write_disk reported and read it
+        // back: the kernel must find the right filesystem there. This proves the table's
+        // offsets point at the images write_disk copied in, on the real formats the Key
+        // uses. The GPT table's own validity is cross-checked against sgdisk in the
+        // cross-platform test; together they show a valid table whose offsets hold the right
+        // filesystems. Skips where a build tool, device-mapper, or losetup is unavailable.
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = KeySpec::new(dir.path());
+        spec.data_size_mb = 16;
+        spec.home_size_mb = 32;
+
+        if build_or_skip(dir.path()).is_none() {
+            return;
+        }
+        match build_data(&spec) {
+            Ok(_) => {}
+            Err(Error::Missing(t)) => {
+                eprintln!("skipping: {t} not installed");
+                return;
+            }
+            Err(e) => panic!("build data: {e}"),
+        }
+        const MASTER: [u8; luks::MASTER_KEY_SIZE] = [0x5a; luks::MASTER_KEY_SIZE];
+        match build_home(&spec, &MASTER) {
+            Ok(_) => {}
+            Err(Error::Missing(t)) => {
+                eprintln!("skipping: {t} not installed");
+                return;
+            }
+            Err(e) if is_dm_unavailable(&e) => {
+                eprintln!("skipping: device-mapper not permitted here ({e})");
+                return;
+            }
+            Err(e) => panic!("build home: {e}"),
+        }
+
+        // write_disk is what build_disk calls; using it directly returns the placements.
+        let linux = gpt::Guid::parse(gpt::LINUX_FS_TYPE).unwrap();
+        let parts = [
+            DiskPart {
+                image: spec.out.join(BASE_IMAGE),
+                type_guid: linux,
+                name: spec.base_label.clone(),
+            },
+            DiskPart {
+                image: spec.out.join(DATA_IMAGE),
+                type_guid: linux,
+                name: spec.data_label.clone(),
+            },
+            DiskPart {
+                image: spec.out.join(HOME_IMAGE),
+                type_guid: linux,
+                name: HOME_LABEL.to_string(),
+            },
+        ];
+        let disk = spec.out.join(DISK_IMAGE);
+        let placed = write_disk(&disk, &parts).expect("assemble the GPT disk");
+        assert_eq!(placed.len(), 3);
+
+        // blkid each partition at its GPT offset: the base is a squashfs, the data store is
+        // a labeled ext4, the Home layer is a LUKS2 container.
+        let mut found = Vec::new();
+        for p in &placed {
+            let Some(dev) = losetup_off(&disk, p.offset, p.size) else {
+                eprintln!("skipping: losetup not permitted here");
+                return;
+            };
+            found.push((p.name.clone(), blkid(&dev)));
+            losetup_d(&dev);
+        }
+
+        assert!(
+            found[0].1.contains("squashfs"),
+            "base not at its offset: {}",
+            found[0].1
+        );
+        assert!(
+            found[1].1.contains("ext4") && found[1].1.contains("HORIZON-DATA"),
+            "data store not at its offset: {}",
+            found[1].1
+        );
+        assert!(
+            found[2].1.contains("crypto_LUKS"),
+            "Home layer not at its offset: {}",
+            found[2].1
+        );
     }
 }

@@ -26,6 +26,9 @@ pub enum Error {
     /// Modules were requested without naming the kernel version to harvest them from.
     #[error("a kernel version is required to install modules")]
     NoKernelVersion,
+    /// A partition image the disk assembly needs has not been built yet.
+    #[error("partition image not found (build it first): {0}")]
+    NoImage(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

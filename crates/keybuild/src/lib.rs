@@ -42,8 +42,9 @@
 //! Partition (`esp.img`) holding the bootloader, kernel, and initramfs. Like verity and the
 //! GPT it owns the format (a minimal FAT16/FAT32 writer, see [`mod@fat`]) rather than
 //! shelling out, because the container has no `mkfs.fat`; it is proven by loop-mounting the
-//! self-built ESP as `vfat` in the container. [`build_disk`] then lays the ESP, base, data,
-//! and Home images side by side under one GPT into a bootable `key.img` (see [`mod@gpt`]).
+//! self-built ESP as `vfat` in the container. [`build_disk`] then lays the ESP, base, the
+//! dm-verity hash device (when built), data, and Home images side by side under one GPT into a
+//! bootable `key.img` (see [`mod@gpt`]).
 //!
 //! [`build_initramfs`] builds the root filesystem the kernel unpacks before any disk is
 //! mounted: a gzip-compressed newc cpio archive (`initramfs.img`) holding `/init`
@@ -67,10 +68,11 @@ pub mod verity;
 pub use error::{Error, Result};
 pub use gpt::Guid;
 pub use verity::{Verity, VerityParams};
-// The HORIZON-HOME label is part of the build/boot contract, so it lives in `init`
-// alongside the base and data labels and is re-exported here, shared by type rather than
-// duplicated. build_home writes it on the Home layer's inner filesystem.
-pub use init::HOME_LABEL;
+// The HORIZON-HOME and HORIZON-VERITY labels are part of the build/boot contract, so they live
+// in `init` alongside the base and data labels and are re-exported here, shared by type rather
+// than duplicated. build_home writes HOME_LABEL on the Home layer's inner filesystem; build_disk
+// writes VERITY_LABEL as the dm-verity hash partition's name, which the init resolves by default.
+pub use init::{HOME_LABEL, VERITY_LABEL};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -99,6 +101,16 @@ pub const ESP_IMAGE: &str = "esp.img";
 
 /// The partition label (GPT PARTLABEL) and FAT volume label of the ESP.
 pub const ESP_LABEL: &str = "HORIZON-ESP";
+
+/// The kernel's filename in the ESP, an 8.3-friendly name the loader config points `linux` at.
+pub const ESP_KERNEL: &str = "VMLINUZ";
+
+/// The initramfs's filename in the ESP, the `initrd` the loader config points at.
+pub const ESP_INITRD: &str = "INITRD.IMG";
+
+/// The systemd-boot entry id: the basename of `/loader/entries/<id>.conf` and the value
+/// `loader.conf`'s `default` names, so the entry this build writes is the one that boots.
+const LOADER_ENTRY_ID: &str = "horizon";
 
 /// The initramfs image's filename: a gzip-compressed newc cpio archive holding `/init`
 /// (`horizon-init`), `cryptsetup`, and the boot-path kernel modules, the root filesystem the
@@ -169,6 +181,24 @@ pub struct KeySpec {
     /// closure. Uses `kernel_version`/`modules_root` like the base modules. Empty installs
     /// none; a module-free kernel (everything built in) needs no initramfs modules.
     pub initramfs_modules: Vec<String>,
+    /// The kernel image (vmlinuz/bzImage) to write into the ESP at [`ESP_KERNEL`]. An external
+    /// artifact (fetched or cross-compiled), so it is a host path like `init_bin`. `Some`
+    /// together with `bootloader` makes [`build_esp`] lay a bootable ESP; both `None` lays the
+    /// `/EFI/BOOT` skeleton (the reproducible default the pure tests use).
+    pub kernel: Option<PathBuf>,
+    /// The UEFI bootloader to write at the removable path `/EFI/BOOT/BOOTX64.EFI`, the one
+    /// firmware runs with no boot entry configured: systemd-boot (`systemd-bootx64.efi`), or
+    /// shim for Secure Boot. An external artifact, so a host path.
+    pub bootloader: Option<PathBuf>,
+    /// Extra EFI binaries to place under `/EFI/BOOT` by their file name (e.g. systemd-boot as
+    /// shim's next stage when `bootloader` is shim). Each is written to `/EFI/BOOT/<filename>`.
+    pub esp_efi: Vec<PathBuf>,
+    /// The dm-verity root hash (lowercase hex) to add to the loader's kernel command line as
+    /// `horizon.verity=`, so the init verifies the base. Set from [`build_verity`]'s output.
+    /// `None` writes no token, so the base mounts unverified.
+    pub verity_root: Option<String>,
+    /// The systemd-boot menu timeout, in seconds, written into `loader.conf`.
+    pub loader_timeout: u32,
 }
 
 impl KeySpec {
@@ -198,6 +228,11 @@ impl KeySpec {
             init_bin: None,
             initramfs_bins: Vec::new(),
             initramfs_modules: Vec::new(),
+            kernel: None,
+            bootloader: None,
+            esp_efi: Vec::new(),
+            verity_root: None,
+            loader_timeout: 3,
         }
     }
 }
@@ -215,6 +250,29 @@ pub fn boot_cmdline(spec: &KeySpec) -> String {
         "horizon.base=LABEL={} horizon.basefs={} horizon.data=LABEL={} horizon.datafs={} horizon.mode={}",
         spec.base_label, spec.basefs, spec.data_label, spec.datafs, mode
     )
+}
+
+/// The systemd-boot `loader.conf`: which entry is default and how long the menu waits. Pure
+/// text, so it is asserted with no bootloader; systemd-boot reads it off the ESP by its long
+/// name (the reason the FAT writer grew long-name support).
+pub fn loader_conf(spec: &KeySpec) -> String {
+    format!(
+        "default {LOADER_ENTRY_ID}\ntimeout {}\n",
+        spec.loader_timeout
+    )
+}
+
+/// The systemd-boot entry at `/loader/entries/<id>.conf`: the title, the kernel and initramfs
+/// paths in the ESP, and the kernel command line. The command line is [`boot_cmdline`] plus a
+/// `horizon.verity=<roothash>` token when [`KeySpec::verity_root`] is set, the dm-verity trust
+/// anchor the loader hands the kernel (it comes from the signed or measured config, never the
+/// disk). Pure, so the exact line a Key boots with is asserted with no boot.
+pub fn loader_entry(spec: &KeySpec) -> String {
+    let mut options = boot_cmdline(spec);
+    if let Some(root) = &spec.verity_root {
+        options.push_str(&format!(" horizon.verity={root}"));
+    }
+    format!("title   Horizon OS\nlinux   /{ESP_KERNEL}\ninitrd  /{ESP_INITRD}\noptions {options}\n")
 }
 
 /// The minimal contents of the immutable base: the standard mountpoint directories the
@@ -437,14 +495,66 @@ pub fn build_esp_with(spec: &KeySpec, tree: &fat::Dir) -> Result<PathBuf> {
     Ok(out)
 }
 
-/// Build the ESP with the default skeleton: the `/EFI/BOOT` directory the removable-media
-/// bootloader path lives in, so the partition is a valid, mountable FAT volume with the
-/// directory structure a bootloader is later written into. Once the bootloader, kernel, and
-/// initramfs exist, the step that builds them passes a populated tree to [`build_esp_with`].
+/// Build the ESP. With a [`KeySpec::kernel`] and [`KeySpec::bootloader`] this lays a bootable
+/// EFI System Partition: the bootloader at the removable path `/EFI/BOOT/BOOTX64.EFI`, the
+/// kernel at [`ESP_KERNEL`] and the built initramfs ([`INITRAMFS_IMAGE`], which must already
+/// exist) at [`ESP_INITRD`], any [`KeySpec::esp_efi`] binaries under `/EFI/BOOT`, and the
+/// systemd-boot loader config ([`loader_conf`], [`loader_entry`]) carrying the boot command
+/// line and the dm-verity root hash. With neither it lays only the `/EFI/BOOT` skeleton (a
+/// valid, mountable FAT volume), the reproducible default the pure tests use; with exactly one
+/// it errors ([`Error::IncompleteEsp`]), since a loadable ESP needs both.
 pub fn build_esp(spec: &KeySpec) -> Result<PathBuf> {
     let mut tree = fat::Dir::new();
-    tree.mkdir("EFI/BOOT")?;
+    match (spec.kernel.as_deref(), spec.bootloader.as_deref()) {
+        (Some(kernel), Some(bootloader)) => populate_esp(spec, &mut tree, kernel, bootloader)?,
+        (None, None) => tree.mkdir("EFI/BOOT")?,
+        _ => return Err(Error::IncompleteEsp),
+    }
     build_esp_with(spec, &tree)
+}
+
+/// Lay a bootable ESP's contents into `tree`: the kernel and the built initramfs at the root,
+/// the bootloader (and any extra EFI binaries) under `/EFI/BOOT`, and the systemd-boot loader
+/// config. The kernel and bootloader are external host artifacts read from disk; the initramfs
+/// is the one [`build_initramfs`] produced under the spec's output directory.
+fn populate_esp(
+    spec: &KeySpec,
+    tree: &mut fat::Dir,
+    kernel: &Path,
+    bootloader: &Path,
+) -> Result<()> {
+    // The kernel and the initramfs at the root, under firmware-friendly 8.3 names.
+    insert_host_file(tree, ESP_KERNEL, kernel)?;
+    let initramfs = spec.out.join(INITRAMFS_IMAGE);
+    if !initramfs.exists() {
+        return Err(Error::NoImage(initramfs));
+    }
+    insert_host_file(tree, ESP_INITRD, &initramfs)?;
+
+    // The bootloader at the removable path firmware runs with no boot entry, plus any extra EFI
+    // binaries (e.g. systemd-boot as shim's next stage) under the same directory.
+    insert_host_file(tree, "EFI/BOOT/BOOTX64.EFI", bootloader)?;
+    for efi in &spec.esp_efi {
+        let name = efi
+            .file_name()
+            .ok_or_else(|| Error::NotAFile(efi.clone()))?;
+        insert_host_file(tree, &format!("EFI/BOOT/{}", name.to_string_lossy()), efi)?;
+    }
+
+    // The systemd-boot loader config: the default entry and timeout, then the entry naming the
+    // kernel, the initramfs, and the kernel command line (with the verity root hash if set).
+    tree.insert_file("loader/loader.conf", loader_conf(spec).into_bytes())?;
+    tree.insert_file(
+        &format!("loader/entries/{LOADER_ENTRY_ID}.conf"),
+        loader_entry(spec).into_bytes(),
+    )?;
+    Ok(())
+}
+
+/// Read a host file and insert its bytes into `tree` at `dest`.
+fn insert_host_file(tree: &mut fat::Dir, dest: &str, src: &Path) -> Result<()> {
+    tree.insert_file(dest, std::fs::read(src)?)?;
+    Ok(())
 }
 
 /// Build the initramfs: the root filesystem the kernel unpacks before any disk is mounted, a
@@ -616,18 +726,17 @@ pub fn write_disk(out: &Path, parts: &[DiskPart]) -> Result<Vec<Placement>> {
     Ok(placements)
 }
 
-/// Assemble a Key's filesystems into a bootable GPT disk at `<out>/key.img`: the FAT ESP, the
-/// immutable base, the plain data store, and the encrypted Home layer, written as the
-/// HORIZON-ESP, HORIZON-BASE, HORIZON-DATA, and HORIZON-HOME partitions. The ESP is partition
-/// one (the conventional place firmware looks) and carries the EFI System Partition type GUID
-/// so firmware recognizes it; the other three carry the generic Linux filesystem type GUID
-/// and are told apart by their labels, which is how `init` resolves them. Each image must
-/// already be built ([`build_esp`], [`build_base`], [`build_data`], [`build_home`]); a missing
-/// one is an error.
-pub fn build_disk(spec: &KeySpec) -> Result<PathBuf> {
+/// The partitions [`build_disk`] lays, in order: the ESP, the immutable base, the dm-verity
+/// hash device (only when [`build_verity`] has produced `base.verity`, placed right after the
+/// base it hashes so the init's `HORIZON-VERITY` label resolves it), then the plain data store
+/// and the encrypted Home layer. The ESP carries the EFI System Partition type GUID so firmware
+/// recognizes it; the rest carry the generic Linux filesystem type GUID and are told apart by
+/// their labels, which is how `init` resolves them. Pure given which images exist, so the
+/// layout is asserted with no build tools.
+fn disk_parts(spec: &KeySpec) -> Vec<DiskPart> {
     let linux = gpt::Guid::parse(gpt::LINUX_FS_TYPE).expect("static type guid parses");
     let esp = gpt::Guid::parse(gpt::ESP_TYPE).expect("static type guid parses");
-    let parts = [
+    let mut parts = vec![
         DiskPart {
             image: spec.out.join(ESP_IMAGE),
             type_guid: esp,
@@ -638,19 +747,37 @@ pub fn build_disk(spec: &KeySpec) -> Result<PathBuf> {
             type_guid: linux,
             name: spec.base_label.clone(),
         },
-        DiskPart {
-            image: spec.out.join(DATA_IMAGE),
-            type_guid: linux,
-            name: spec.data_label.clone(),
-        },
-        DiskPart {
-            image: spec.out.join(HOME_IMAGE),
-            type_guid: linux,
-            name: HOME_LABEL.to_string(),
-        },
     ];
+    let verity = spec.out.join(VERITY_IMAGE);
+    if verity.exists() {
+        parts.push(DiskPart {
+            image: verity,
+            type_guid: linux,
+            name: VERITY_LABEL.to_string(),
+        });
+    }
+    parts.push(DiskPart {
+        image: spec.out.join(DATA_IMAGE),
+        type_guid: linux,
+        name: spec.data_label.clone(),
+    });
+    parts.push(DiskPart {
+        image: spec.out.join(HOME_IMAGE),
+        type_guid: linux,
+        name: HOME_LABEL.to_string(),
+    });
+    parts
+}
+
+/// Assemble a Key's filesystems into a bootable GPT disk at `<out>/key.img`: the FAT ESP
+/// (partition one, where firmware looks), the immutable base, the dm-verity hash device when
+/// the base was made tamper-evident, the plain data store, and the encrypted Home layer (see
+/// [`disk_parts`] for the order and types). Each image named must already be built
+/// ([`build_esp`], [`build_base`], optionally [`build_verity`], [`build_data`], [`build_home`]);
+/// a missing one is an error.
+pub fn build_disk(spec: &KeySpec) -> Result<PathBuf> {
     let out = spec.out.join(DISK_IMAGE);
-    write_disk(&out, &parts)?;
+    write_disk(&out, &disk_parts(spec))?;
     Ok(out)
 }
 
@@ -1017,6 +1144,65 @@ mod tests {
             assert_eq!(parsed.datafs, spec.datafs);
             assert_eq!(parsed.mode, mode);
         }
+    }
+
+    #[test]
+    fn loader_config_carries_the_cmdline_and_verity_root() {
+        let mut spec = KeySpec::new("/tmp/key");
+        spec.loader_timeout = 5;
+
+        // loader.conf names the default entry and the timeout.
+        let conf = loader_conf(&spec);
+        assert!(conf.contains("default horizon"), "{conf}");
+        assert!(conf.contains("timeout 5"), "{conf}");
+
+        // Without a verity root, the entry's options are exactly the boot command line.
+        let entry = loader_entry(&spec);
+        assert!(entry.contains("title   Horizon OS"));
+        assert!(entry.contains(&format!("linux   /{ESP_KERNEL}")));
+        assert!(entry.contains(&format!("initrd  /{ESP_INITRD}")));
+        assert!(entry.contains(&format!("options {}", boot_cmdline(&spec))));
+        assert!(!entry.contains("horizon.verity="));
+
+        // With a verity root, the token is appended; the whole options line parses back through
+        // the init's own parser to that root hash, so a build and a boot cannot drift apart.
+        spec.verity_root = Some("deadbeefcafe".into());
+        let entry = loader_entry(&spec);
+        let options = entry
+            .lines()
+            .find_map(|l| l.strip_prefix("options "))
+            .expect("an options line");
+        let parsed = parse_cmdline(options);
+        assert_eq!(parsed.verity.as_deref(), Some("deadbeefcafe"));
+        // The verity hash device defaults to its label, so the loader need not name it.
+        assert_eq!(parsed.verity_dev, Spec::Label(VERITY_LABEL.to_string()));
+    }
+
+    #[test]
+    fn disk_includes_the_verity_partition_only_when_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = KeySpec::new(dir.path());
+
+        // Without base.verity, the disk is the four standard partitions in order.
+        let names: Vec<String> = disk_parts(&spec).iter().map(|p| p.name.clone()).collect();
+        assert_eq!(names, [ESP_LABEL, BASE_LABEL, DATA_LABEL, HOME_LABEL]);
+
+        // build_verity writing base.verity inserts HORIZON-VERITY right after the base it hashes.
+        std::fs::write(dir.path().join(VERITY_IMAGE), b"hash device").unwrap();
+        let parts = disk_parts(&spec);
+        let names: Vec<String> = parts.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(
+            names,
+            [ESP_LABEL, BASE_LABEL, VERITY_LABEL, DATA_LABEL, HOME_LABEL]
+        );
+        // The verity partition is the base.verity image under a Linux-filesystem type GUID, told
+        // apart from base/data/home by its label alone.
+        let verity = parts.iter().find(|p| p.name == VERITY_LABEL).unwrap();
+        assert_eq!(verity.image, dir.path().join(VERITY_IMAGE));
+        assert_eq!(
+            verity.type_guid,
+            gpt::Guid::parse(gpt::LINUX_FS_TYPE).unwrap()
+        );
     }
 
     #[test]
@@ -2299,13 +2485,14 @@ mod linux_tests {
 
     #[test]
     fn build_disk_places_each_filesystem_at_its_gpt_offset() {
-        // Assemble a real Key (FAT ESP, squashfs base, ext4 data store, LUKS2 Home layer) into
-        // a GPT disk, then attach each partition at the offset write_disk reported and read it
-        // back: the kernel must find the right filesystem there. This proves the table's
-        // offsets point at the images write_disk copied in, on the real formats the Key
-        // uses. The GPT table's own validity is cross-checked against sgdisk in the
-        // cross-platform test; together they show a valid table whose offsets hold the right
-        // filesystems. Skips where a build tool, device-mapper, or losetup is unavailable.
+        // Assemble a real Key (FAT ESP, squashfs base, dm-verity hash device, ext4 data store,
+        // LUKS2 Home layer) into a GPT disk through disk_parts (exactly what build_disk lays),
+        // then attach each partition at the offset write_disk reported and read it back: the
+        // kernel must find the right filesystem there, and the verity partition its dm-verity
+        // superblock. This proves the table's offsets point at the images write_disk copied in,
+        // on the real formats the Key uses, with the hash partition in its place. The GPT
+        // table's own validity is cross-checked against sgdisk in the cross-platform test. Skips
+        // where a build tool, device-mapper, or losetup is unavailable.
         let dir = tempfile::tempdir().unwrap();
         let mut spec = KeySpec::new(dir.path());
         spec.data_size_mb = 16;
@@ -2339,68 +2526,67 @@ mod linux_tests {
             Err(e) => panic!("build home: {e}"),
         }
 
-        // write_disk is what build_disk calls; using it directly returns the placements. The
-        // ESP is partition one with the EFI System Partition type, the rest carry the generic
-        // Linux type, the same order build_disk lays them.
-        let linux = gpt::Guid::parse(gpt::LINUX_FS_TYPE).unwrap();
-        let esp = gpt::Guid::parse(gpt::ESP_TYPE).unwrap();
-        let parts = [
-            DiskPart {
-                image: spec.out.join(ESP_IMAGE),
-                type_guid: esp,
-                name: ESP_LABEL.to_string(),
-            },
-            DiskPart {
-                image: spec.out.join(BASE_IMAGE),
-                type_guid: linux,
-                name: spec.base_label.clone(),
-            },
-            DiskPart {
-                image: spec.out.join(DATA_IMAGE),
-                type_guid: linux,
-                name: spec.data_label.clone(),
-            },
-            DiskPart {
-                image: spec.out.join(HOME_IMAGE),
-                type_guid: linux,
-                name: HOME_LABEL.to_string(),
-            },
-        ];
+        // Make the base tamper-evident, so the disk carries the dm-verity hash partition.
+        // build_verity is owned pure Rust (no external tool), so it never skips.
+        build_verity(&spec).expect("build verity");
+
+        // disk_parts is exactly what build_disk lays; write_disk on it returns the placements.
+        // With base.verity present the order is ESP, base, verity, data, Home.
         let disk = spec.out.join(DISK_IMAGE);
+        let parts = disk_parts(&spec);
         let placed = write_disk(&disk, &parts).expect("assemble the GPT disk");
-        assert_eq!(placed.len(), 4);
+        assert_eq!(
+            placed.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            [
+                ESP_LABEL,
+                spec.base_label.as_str(),
+                VERITY_LABEL,
+                spec.data_label.as_str(),
+                HOME_LABEL,
+            ]
+        );
 
-        // blkid each partition at its GPT offset: the ESP is a vfat filesystem, the base a
-        // squashfs, the data store a labeled ext4, the Home layer a LUKS2 container.
-        let mut found = Vec::new();
-        for p in &placed {
-            let Some(dev) = losetup_off(&disk, p.offset, p.size) else {
-                eprintln!("skipping: losetup not permitted here");
-                return;
-            };
-            found.push((p.name.clone(), blkid(&dev)));
+        // The dm-verity hash partition has no filesystem; read its superblock magic straight
+        // from the disk image at the offset the table points to.
+        let v = placed
+            .iter()
+            .find(|p| p.name == VERITY_LABEL)
+            .expect("verity placement");
+        let disk_bytes = std::fs::read(&disk).unwrap();
+        assert_eq!(
+            &disk_bytes[v.offset as usize..v.offset as usize + 8],
+            b"verity\0\0",
+            "dm-verity superblock not at the verity partition offset"
+        );
+
+        // blkid the filesystem partitions at their offsets: ESP vfat, base squashfs, data ext4,
+        // Home LUKS2. Skips if losetup is not permitted (the verity magic check above already ran).
+        let probe = |name: &str| -> Option<String> {
+            let p = placed.iter().find(|p| p.name == name).unwrap();
+            let dev = losetup_off(&disk, p.offset, p.size)?;
+            let id = blkid(&dev);
             losetup_d(&dev);
-        }
-
+            Some(id)
+        };
+        let Some(esp_id) = probe(ESP_LABEL) else {
+            eprintln!("skipping: losetup not permitted here");
+            return;
+        };
+        assert!(esp_id.contains("vfat"), "esp not at its offset: {esp_id}");
+        let base_id = probe(&spec.base_label).unwrap();
         assert!(
-            found[0].1.contains("vfat"),
-            "esp not at its offset: {}",
-            found[0].1
+            base_id.contains("squashfs"),
+            "base not at its offset: {base_id}"
         );
+        let data_id = probe(&spec.data_label).unwrap();
         assert!(
-            found[1].1.contains("squashfs"),
-            "base not at its offset: {}",
-            found[1].1
+            data_id.contains("ext4") && data_id.contains("HORIZON-DATA"),
+            "data store not at its offset: {data_id}"
         );
+        let home_id = probe(HOME_LABEL).unwrap();
         assert!(
-            found[2].1.contains("ext4") && found[2].1.contains("HORIZON-DATA"),
-            "data store not at its offset: {}",
-            found[2].1
-        );
-        assert!(
-            found[3].1.contains("crypto_LUKS"),
-            "Home layer not at its offset: {}",
-            found[3].1
+            home_id.contains("crypto_LUKS"),
+            "Home layer not at its offset: {home_id}"
         );
     }
 
@@ -2498,6 +2684,78 @@ mod linux_tests {
                 "{size_mb} MiB ESP: entries/horizon.conf reads back by its long name"
             );
         }
+    }
+
+    #[test]
+    fn a_bootable_esp_mounts_with_the_loader_kernel_and_initramfs() {
+        // build_esp with a kernel and bootloader lays a loadable ESP; mount it as vfat and read
+        // every piece back through the kernel's own FAT driver: the bootloader at the removable
+        // path, the kernel and the built initramfs at the root, and the systemd-boot loader
+        // config by its long names, carrying the boot command line and the dm-verity root hash.
+        // The kernel and bootloader bytes are stand-ins (the real artifacts are eye-verified at
+        // the QEMU boot); the assembly, the layout, and the config are what this proves. Skips
+        // where losetup or mounting is not permitted.
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = KeySpec::new(dir.path());
+        spec.esp_size_mb = 64; // FAT32, a realistic ESP
+        spec.loader_timeout = 4;
+        spec.verity_root = Some("00112233445566778899aabbccddeeff".into());
+
+        // Stand-in external artifacts plus a stand-in initramfs at the path build_initramfs
+        // writes, all multi-cluster so the cluster-chain path is exercised.
+        let kernel = vec![0xA5u8; 200_000];
+        let loader = b"systemd-boot stand-in".to_vec();
+        let initramfs = vec![0x5Au8; 150_000];
+        std::fs::create_dir_all(&spec.out).unwrap();
+        let kpath = dir.path().join("vmlinuz-host");
+        let lpath = dir.path().join("systemd-bootx64.efi");
+        std::fs::write(&kpath, &kernel).unwrap();
+        std::fs::write(&lpath, &loader).unwrap();
+        std::fs::write(spec.out.join(INITRAMFS_IMAGE), &initramfs).unwrap();
+        spec.kernel = Some(kpath);
+        spec.bootloader = Some(lpath);
+
+        let img = build_esp(&spec).expect("build a bootable esp");
+        let size = std::fs::metadata(&img).unwrap().len();
+        let Some(dev) = losetup_off(&img, 0, size) else {
+            eprintln!("skipping: losetup not permitted here");
+            return;
+        };
+        let mnt = dir.path().join("mnt");
+        std::fs::create_dir_all(&mnt).unwrap();
+        if !mount_vfat(&dev, &mnt) {
+            losetup_d(&dev);
+            return;
+        }
+
+        let boot = std::fs::read(mnt.join("EFI/BOOT/BOOTX64.EFI"));
+        let vmlinuz = std::fs::read(mnt.join(ESP_KERNEL));
+        let initrd = std::fs::read(mnt.join(ESP_INITRD));
+        let conf = std::fs::read_to_string(mnt.join("loader/loader.conf"));
+        let entry = std::fs::read_to_string(mnt.join("loader/entries/horizon.conf"));
+        umount(&mnt);
+        losetup_d(&dev);
+
+        assert_eq!(boot.unwrap(), loader, "bootloader at the removable path");
+        assert_eq!(vmlinuz.unwrap(), kernel, "kernel at the root");
+        assert_eq!(initrd.unwrap(), initramfs, "initramfs at the root");
+        let conf = conf.unwrap();
+        assert!(
+            conf.contains("default horizon") && conf.contains("timeout 4"),
+            "loader.conf: {conf}"
+        );
+        let entry = entry.unwrap();
+        assert!(entry.contains("linux   /VMLINUZ"), "entry: {entry}");
+        assert!(entry.contains("initrd  /INITRD.IMG"), "entry: {entry}");
+        // The boot command line and the verity root hash the init reads are in the options.
+        assert!(
+            entry.contains("horizon.base=LABEL=HORIZON-BASE"),
+            "entry: {entry}"
+        );
+        assert!(
+            entry.contains("horizon.verity=00112233445566778899aabbccddeeff"),
+            "entry: {entry}"
+        );
     }
 
     // The initramfs cross-check: build a real initramfs, gunzip it, and parse the cpio back.

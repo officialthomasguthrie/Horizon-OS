@@ -29,10 +29,14 @@ pub enum Error {
     /// A partition image the disk assembly needs has not been built yet.
     #[error("partition image not found (build it first): {0}")]
     NoImage(PathBuf),
-    /// A file or directory name placed in the ESP is not a valid 8.3 short name (the only
-    /// form the minimal FAT writer emits): too long, an empty base, or an illegal character.
-    #[error("not a valid 8.3 short name: {0}")]
+    /// A file or directory name placed in the ESP is not usable as an 8.3 short name or a VFAT
+    /// long name: an empty or reserved name, an illegal character, or past the length limit.
+    #[error("not a usable FAT name: {0}")]
     BadName(String),
+    /// A bootable ESP was asked for (a bootloader given) without a kernel, or vice versa: both
+    /// are needed, alongside the built initramfs, to write a loadable EFI System Partition.
+    #[error("a bootable ESP needs both a kernel and a bootloader")]
+    IncompleteEsp,
     /// The ESP contents do not fit in the partition: more clusters are needed than it holds.
     #[error("ESP contents do not fit: need {needed} clusters, partition holds {available}")]
     EspFull { needed: u64, available: u64 },

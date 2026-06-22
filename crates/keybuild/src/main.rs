@@ -10,13 +10,17 @@
 // dm-verity hash tree over the base into base.verity and prints the root hash that anchors
 // it. --home builds the encrypted Home writable layer (home.img, a LUKS2 container) keyed
 // by the 32-byte master in --home-keyfile, so a Home Surface persists encrypted at rest.
-// --esp builds the FAT EFI System Partition (esp.img) with the /EFI/BOOT skeleton, the
-// partition firmware reads the bootloader from. --disk assembles the ESP, base, data, and
-// Home partitions into one bootable GPT disk (key.img), building the ESP, data, and Home
-// partitions too, so it needs --home-keyfile. --initramfs builds the initramfs (initramfs.img,
-// a gzip newc cpio) with /init from --init-bin (horizon-init), each --initramfs-bin
-// (cryptsetup) under /usr/sbin, and each --initramfs-module under /lib/modules/<kver>, all
-// with their shared-library / modules.dep closures.
+// --esp builds the FAT EFI System Partition (esp.img). With --kernel and --bootloader it is a
+// loadable ESP: the bootloader (systemd-boot, or shim) at /EFI/BOOT/BOOTX64.EFI, the kernel and
+// the built initramfs at the root, any --esp-efi binaries under /EFI/BOOT, and the systemd-boot
+// loader config carrying the boot command line plus the dm-verity root hash from --verity (with
+// --loader-timeout setting the menu wait); with neither it lays the /EFI/BOOT skeleton. --disk
+// assembles the ESP, base, the verity hash device (when --verity), data, and Home partitions
+// into one bootable GPT disk (key.img), building the ESP, data, and Home partitions too, so it
+// needs --home-keyfile. --initramfs builds the initramfs (initramfs.img, a gzip newc cpio) with
+// /init from --init-bin (horizon-init), each --initramfs-bin (cryptsetup) under /usr/sbin, and
+// each --initramfs-module under /lib/modules/<kver>, all with their shared-library / modules.dep
+// closures; it is built before the ESP so a bootable ESP can write it in.
 // The build logic is in the keybuild library, tested there; this is the thin CLI over it.
 
 use std::path::PathBuf;
@@ -39,6 +43,10 @@ struct Args {
     init_bin: Option<PathBuf>,
     initramfs_bins: Vec<PathBuf>,
     initramfs_modules: Vec<String>,
+    kernel: Option<PathBuf>,
+    bootloader: Option<PathBuf>,
+    esp_efi: Vec<PathBuf>,
+    loader_timeout: Option<u32>,
 }
 
 fn main() -> ExitCode {
@@ -50,7 +58,9 @@ fn main() -> ExitCode {
              [--firmware <path>]... [--firmware-root <dir>] [--verity] \
              [--home --home-keyfile <32-byte-master>] [--esp] [--disk] \
              [--initramfs --init-bin <path> [--initramfs-bin <path>]... \
-             [--initramfs-module <name>]...]"
+             [--initramfs-module <name>]...] \
+             [--kernel <path> --bootloader <path> [--esp-efi <path>]... \
+             [--loader-timeout <secs>]]"
         );
         return ExitCode::FAILURE;
     };
@@ -69,6 +79,12 @@ fn main() -> ExitCode {
     spec.init_bin = parsed.init_bin;
     spec.initramfs_bins = parsed.initramfs_bins;
     spec.initramfs_modules = parsed.initramfs_modules;
+    spec.kernel = parsed.kernel;
+    spec.bootloader = parsed.bootloader;
+    spec.esp_efi = parsed.esp_efi;
+    if let Some(t) = parsed.loader_timeout {
+        spec.loader_timeout = t;
+    }
     let verity = parsed.verity;
     let disk = parsed.disk;
     let initramfs = parsed.initramfs;
@@ -96,8 +112,10 @@ fn main() -> ExitCode {
             if !spec.firmware.is_empty() {
                 println!("firmware: {} blob(s)", spec.firmware.len());
             }
-            // dm-verity over the just-built base: a tamper-evident immutable layer anchored
-            // by the printed root hash, which a bootloader carries (signed or measured).
+            // dm-verity over the just-built base: a tamper-evident immutable layer anchored by
+            // the printed root hash, which the loader config carries into the kernel command
+            // line (horizon.verity=) so the init verifies the base. Threading the root onto the
+            // spec is what lets the ESP step below write it into the loader config.
             if verity {
                 match keybuild::build_verity(&spec) {
                     Ok(v) => {
@@ -108,6 +126,7 @@ fn main() -> ExitCode {
                             v.levels
                         );
                         println!("verity root: {}", v.root_hex());
+                        spec.verity_root = Some(v.root_hex());
                     }
                     Err(e) => {
                         eprintln!("horizon-keybuild: verity: {e}");
@@ -138,26 +157,9 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            // The FAT EFI System Partition with its /EFI/BOOT skeleton, the partition firmware
-            // reads the bootloader from.
-            if esp {
-                match keybuild::build_esp(&spec) {
-                    Ok(p) => println!(
-                        "esp: built {} ({} MiB FAT, label {})",
-                        p.display(),
-                        spec.esp_size_mb,
-                        keybuild::ESP_LABEL
-                    ),
-                    Err(e) => {
-                        eprintln!("horizon-keybuild: esp: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
             // The initramfs: the cpio root filesystem the kernel unpacks before any disk,
-            // holding /init (horizon-init) and cryptsetup with their closures and the
-            // boot-path modules. Independent of the disk for now; the bootloader step writes
-            // it into the ESP.
+            // holding /init (horizon-init) and cryptsetup with their closures and the boot-path
+            // modules. Built before the ESP, since a bootable ESP writes it in as INITRD.IMG.
             if initramfs {
                 match keybuild::build_initramfs(&spec) {
                     Ok(p) => println!(
@@ -172,6 +174,30 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            // The FAT EFI System Partition. With a kernel and bootloader it is a loadable ESP
+            // (bootloader at /EFI/BOOT/BOOTX64.EFI, the kernel and initramfs at the root, the
+            // systemd-boot loader config carrying the boot command line and the verity root);
+            // with neither it is the /EFI/BOOT skeleton, the partition firmware reads from.
+            if esp {
+                let bootable = spec.kernel.is_some() && spec.bootloader.is_some();
+                match keybuild::build_esp(&spec) {
+                    Ok(p) => println!(
+                        "esp: built {} ({} MiB FAT, label {}, {})",
+                        p.display(),
+                        spec.esp_size_mb,
+                        keybuild::ESP_LABEL,
+                        if bootable {
+                            "bootloader + kernel + initramfs + loader config"
+                        } else {
+                            "/EFI/BOOT skeleton"
+                        }
+                    ),
+                    Err(e) => {
+                        eprintln!("horizon-keybuild: esp: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             // Assemble the partitions into a bootable GPT disk. The disk carries the plain
             // data store partition too, so build it here; the base, the Home layer, and the
             // ESP are already built above.
@@ -181,14 +207,16 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 match keybuild::build_disk(&spec) {
-                    Ok(p) => println!(
-                        "disk: built {} (GPT: {} / {} / {} / {})",
-                        p.display(),
-                        keybuild::ESP_LABEL,
-                        spec.base_label,
-                        spec.data_label,
-                        keybuild::HOME_LABEL
-                    ),
+                    Ok(p) => {
+                        // The verity hash partition is laid only when --verity built base.verity.
+                        let mut labels = vec![keybuild::ESP_LABEL, spec.base_label.as_str()];
+                        if verity {
+                            labels.push(keybuild::VERITY_LABEL);
+                        }
+                        labels.push(spec.data_label.as_str());
+                        labels.push(keybuild::HOME_LABEL);
+                        println!("disk: built {} (GPT: {})", p.display(), labels.join(" / "));
+                    }
                     Err(e) => {
                         eprintln!("horizon-keybuild: disk: {e}");
                         return ExitCode::FAILURE;
@@ -222,6 +250,10 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut init_bin = None;
     let mut initramfs_bins = Vec::new();
     let mut initramfs_modules = Vec::new();
+    let mut kernel = None;
+    let mut bootloader = None;
+    let mut esp_efi = Vec::new();
+    let mut loader_timeout = None;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -241,6 +273,10 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--init-bin" => init_bin = Some(PathBuf::from(it.next()?)),
             "--initramfs-bin" => initramfs_bins.push(PathBuf::from(it.next()?)),
             "--initramfs-module" => initramfs_modules.push(it.next()?.clone()),
+            "--kernel" => kernel = Some(PathBuf::from(it.next()?)),
+            "--bootloader" => bootloader = Some(PathBuf::from(it.next()?)),
+            "--esp-efi" => esp_efi.push(PathBuf::from(it.next()?)),
+            "--loader-timeout" => loader_timeout = Some(it.next()?.parse().ok()?),
             _ => return None,
         }
     }
@@ -261,6 +297,10 @@ fn parse_args(args: &[String]) -> Option<Args> {
         init_bin,
         initramfs_bins,
         initramfs_modules,
+        kernel,
+        bootloader,
+        esp_efi,
+        loader_timeout,
     })
 }
 

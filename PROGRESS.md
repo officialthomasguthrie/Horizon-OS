@@ -1030,6 +1030,38 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   lands with the real kernel toolchain (this container has no kmod); this text `modules.dep` is what
   that pass consumes. Left next: dm-verity over the base, LUKS2, the bootloader, and the QEMU boot.
   Built and tested on darwin and in the Linux container.
+- Phase 0 base dm-verity (`keybuild` crate + `horizon-keybuild`): the immutable base is now
+  tamper-evident, not just read-only. Read-only is not trusted: a Key's base partition can be
+  rewritten offline. dm-verity closes that by hashing the base into a SHA-256 Merkle tree whose
+  single root hash is the trust anchor; the kernel checks every base block against the tree on
+  read and the tree against the root, so a single flipped byte anywhere in the base is caught the
+  moment it is read, and the root is small enough to carry through a trusted channel (a signed
+  initramfs, a measured boot). A new `keybuild::verity` builds the hash tree and superblock in the
+  exact on-disk format `veritysetup` writes, so the kernel's `dm-verity` target opens it unchanged,
+  and `build_verity` reads `base.squashfs`, writes the hash device to `base.verity`, and returns the
+  root hash. The format is the cryptsetup default: superblock version 1, hash type 1 (the salt is
+  prepended to each hashed block), SHA-256 digests (the one place Horizon hashes with SHA-256 rather
+  than the Lifestream's BLAKE3, because it must match what the kernel reads), 4096-byte blocks. The
+  leaves hash the data blocks, each level above hashes the full padded blocks beneath it until a
+  single top block remains, and the levels are laid out on the hash device top first and leaves last
+  with the superblock in the first block; the degenerate single-block base is the one veritysetup
+  special-cases (no hash blocks stored, the root hashes the data block directly), handled to match.
+  keybuild owns the format rather than shelling out to `veritysetup` for the same reasons it owns its
+  other formats: the build stays reproducible (a fixed salt and UUID, so the same base yields the same
+  root) and the security-critical core is pure logic that builds and tests on any host (the new dep is
+  the `sha2` crate, pure Rust). On the usual split the pure tree is proven everywhere: unit tests for
+  the level math, the superblock fields, determinism, that a flipped data byte moves the root (tamper
+  detection), and a SHA-256 known-answer pinned to an independently computed value so a wrong hash
+  cannot pass. The proof it is byte-exact is a gated test that cross-checks the hash device and root
+  against `veritysetup format` itself across one-, two-, and three-level trees and differing block
+  sizes; it needs only the veritysetup binary (no loop devices, no root), so it runs in CI as well as
+  the container (cryptsetup-bin added to both), and a second container test runs `build_verity` over a
+  real squashfs base and cross-checks that too. The kernel-side `dm-verity` open is eye-verified by
+  booting, since this build container's kernel lacks `CONFIG_DM_VERITY`. `horizon-keybuild --verity`
+  builds the hash device and prints the root; verified end to end through the binary in the container,
+  where its `base.verity` is byte-for-byte identical (`cmp`) to veritysetup's output over the same base
+  and the printed root matches. Left next: LUKS2 for the writable layer and the Ghost store handoff,
+  the bootloader, and the QEMU boot. Built and tested on darwin and in the Linux container.
 
 ## Next
 
@@ -1163,7 +1195,7 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   Linux for the real key and the desktop; the keyslot core, the secret-sharing core,
   the boot unlock core, and the CLI are cross-platform.
 - Phase 0 proper: the actual bootable artifact this orchestration slots into, the real
-  "boots anywhere and remembers" demo. Five steps are done. The init (the `init` crate +
+  "boots anywhere and remembers" demo. Six steps are done. The init (the `init` crate +
   `horizon-init`): the generic initramfs init that assembles the immutable-base +
   writable-overlay root (Home device or Ghost tmpfs), carries the Key's store into the
   new root, and switch_roots into `horizon boot`, with the policy pure and tested
@@ -1186,11 +1218,14 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   (`module_closure`, the module analog of the ldd closure), plus the named firmware blobs at
   `/lib/firmware`, so the base drives hardware; the closure and placement are plain filesystem
   work proven on every host and through the real squashfs in the container, with the binary
-  module index (`modules.dep.bin`) a `depmod` pass for the real kernel toolchain.
-  What is left, in order: dm-verity over the base so the immutable layer is
-  tamper-evident (a pure-Rust hash tree cross-checked against `veritysetup format`, the
-  kernel open eye-verified by booting since this container's kernel lacks
-  CONFIG_DM_VERITY); LUKS2 for the Home writable layer and the Ghost read-only store
+  module index (`modules.dep.bin`) a `depmod` pass for the real kernel toolchain. And the
+  base dm-verity: `keybuild::verity` builds a SHA-256 Merkle hash tree over `base.squashfs`
+  in the exact format `veritysetup` writes and `build_verity` emits it to `base.verity` with
+  the root hash that anchors it, so the immutable base is tamper-evident, not just read-only;
+  the tree is owned pure Rust (the `sha2` dep), proven byte-for-byte against `veritysetup
+  format` in a gated test that runs in CI and the container, with the kernel `dm-verity` open
+  eye-verified by booting since this container's kernel lacks CONFIG_DM_VERITY.
+  What is left, in order: LUKS2 for the Home writable layer and the Ghost read-only store
   handoff, unlocked with the same master the `boot` crate recovers (CONFIG_DM_CRYPT=y
   here, so cryptsetup open is testable in the container); the isohybrid UEFI/BIOS
   bootloader (shim -> systemd-boot/GRUB -> kernel + initramfs) into a bootable Key

@@ -75,6 +75,7 @@ pub use init::HOME_LABEL;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use init::ModeChoice;
 use init::{BASE_LABEL, DATA_LABEL};
@@ -354,9 +355,15 @@ pub fn build_home(spec: &KeySpec, master: &[u8; luks::MASTER_KEY_SIZE]) -> Resul
     luks::format(&out, master)?;
 
     // Open the volume, lay an empty ext4 inside, then close, closing even if mkfs fails so
-    // the device-mapper node is never left behind. The mapper name is unique to this build
-    // so concurrent builds do not collide on one global name.
-    let mapper = format!("horizon-home-build-{}", std::process::id());
+    // the device-mapper node is never left behind. The mapper name is unique to this call (the
+    // pid plus a process-global counter, like the Lifestream temp-file fix) so two concurrent
+    // builds, or two tests building a Home layer in parallel, never collide on one global name.
+    static BUILD_MAPPER_SEQ: AtomicU64 = AtomicU64::new(0);
+    let mapper = format!(
+        "horizon-home-build-{}-{}",
+        std::process::id(),
+        BUILD_MAPPER_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     let dev = luks::open(&out, master, &mapper)?;
     let mkfs = {
         let mut cmd = Command::new("mkfs.ext4");

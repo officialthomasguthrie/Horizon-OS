@@ -14,8 +14,8 @@ use nix::mount::{mount, MsFlags};
 use nix::unistd::{chdir, chroot, execv};
 
 use crate::{
-    luks_close_args, luks_open_args, mapper_path, Error, MountFlags, Plan, Source, Spec, Step,
-    MASTER_KEY_SIZE,
+    luks_close_args, luks_open_args, mapper_path, verity_close_args, verity_open_args, Error,
+    MountFlags, Plan, Source, Spec, Step, MASTER_KEY_SIZE,
 };
 
 // A typed None for the source/fstype/data arguments mount does not need.
@@ -218,6 +218,55 @@ pub fn luks_close(mapper: &str) -> Result<(), Error> {
     } else {
         Err(Error::step(
             "luksClose",
+            Path::new(mapper),
+            tool_error(&out.stderr),
+        ))
+    }
+}
+
+/// Open the dm-verity device over the immutable base: verify the base partition at
+/// `data_dev` against the Merkle tree on `hash_dev` anchored by `root_hash` (lowercase
+/// hex), exposing the verified read-only base at `/dev/mapper/<mapper>`, and return that
+/// path. Unlike the LUKS master, the root hash is a public trust anchor (it comes from the
+/// signed or measured loader config), so it is passed as an argument, not on stdin.
+///
+/// A base that does not hash to `root_hash`, or device-mapper being unavailable, fails
+/// here, which is the point: a tampered base does not mount. This is the boot-time consumer
+/// of what keybuild's `verity::format` wrote, the read side to its write side, exactly as
+/// [`luks_open`] consumes the LUKS layer keybuild's formatter built.
+pub fn verity_open(
+    data_dev: &Path,
+    hash_dev: &Path,
+    mapper: &str,
+    root_hash: &str,
+) -> Result<PathBuf, Error> {
+    let out = Command::new("veritysetup")
+        .args(verity_open_args(data_dev, hash_dev, mapper, root_hash))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| Error::step("verityOpen", data_dev, e))?;
+    if out.status.success() {
+        Ok(mapper_path(mapper))
+    } else {
+        Err(Error::step("verityOpen", data_dev, tool_error(&out.stderr)))
+    }
+}
+
+/// Close the device-mapper node `mapper` (tear down the verified base mapping). Paired
+/// with [`verity_open`] so a teardown path never leaves the mapping open.
+pub fn verity_close(mapper: &str) -> Result<(), Error> {
+    let out = Command::new("veritysetup")
+        .args(verity_close_args(mapper))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| Error::step("verityClose", Path::new(mapper), e))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(Error::step(
+            "verityClose",
             Path::new(mapper),
             tool_error(&out.stderr),
         ))

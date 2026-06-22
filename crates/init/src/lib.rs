@@ -40,7 +40,10 @@ pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{execute, is_unprivileged_error, luks_close, luks_open, mount_proc, resolve};
+pub use linux::{
+    execute, is_unprivileged_error, luks_close, luks_open, mount_proc, resolve, verity_close,
+    verity_open,
+};
 
 use std::path::{Path, PathBuf};
 
@@ -61,6 +64,13 @@ pub const DEFAULT_INIT: &str = "/usr/bin/horizon";
 pub const BASE_LABEL: &str = "HORIZON-BASE";
 pub const DATA_LABEL: &str = "HORIZON-DATA";
 pub const HOME_LABEL: &str = "HORIZON-HOME";
+
+/// The partition label of the dm-verity hash device: a Merkle tree over the immutable
+/// base, with no filesystem of its own. It is consulted only when the kernel command line
+/// carries a `horizon.verity` root hash (the trust anchor the loader supplies); absent
+/// that token the base is mounted unverified, the same "boots anywhere" degradation a
+/// missing data or Home partition gets.
+pub const VERITY_LABEL: &str = "HORIZON-VERITY";
 
 /// Where the new root is assembled and where the Key's identity store is bound, both
 /// under the initramfs's own tmpfs. The store path is what `horizon boot --root` is
@@ -422,6 +432,13 @@ pub struct Params {
     pub home: Spec,
     /// The filesystem inside the Home layer, mounted once the LUKS volume is open.
     pub homefs: String,
+    /// The dm-verity root hash anchoring the immutable base, lowercase hex. `Some` opens a
+    /// verified read-only base over the raw partition before it is mounted; `None` (the
+    /// token absent) mounts the base unverified. It is a trust anchor, so it comes from the
+    /// signed or measured loader config, never from the disk.
+    pub verity: Option<String>,
+    /// The dm-verity hash device (the Merkle tree). Consulted only when `verity` is `Some`.
+    pub verity_dev: Spec,
     pub mode: ModeChoice,
     pub init: PathBuf,
     pub init_args: Vec<String>,
@@ -436,6 +453,8 @@ impl Default for Params {
             datafs: "ext4".into(),
             home: Spec::Label(HOME_LABEL.into()),
             homefs: "ext4".into(),
+            verity: None,
+            verity_dev: Spec::Label(VERITY_LABEL.into()),
             mode: ModeChoice::Auto,
             init: PathBuf::from(DEFAULT_INIT),
             init_args: vec!["boot".into()],
@@ -445,8 +464,9 @@ impl Default for Params {
 
 /// Parse the kernel command line into [`Params`]. Recognized tokens, all optional:
 /// `horizon.base=`, `horizon.basefs=`, `horizon.data=`, `horizon.datafs=`,
-/// `horizon.home=`, `horizon.homefs=`, `horizon.mode=home|ghost|auto`, `horizon.init=`.
-/// Anything else (the kernel's own arguments) is ignored.
+/// `horizon.home=`, `horizon.homefs=`, `horizon.verity=<roothash>`, `horizon.veritydev=`,
+/// `horizon.mode=home|ghost|auto`, `horizon.init=`. Anything else (the kernel's own
+/// arguments) is ignored.
 pub fn parse_cmdline(cmdline: &str) -> Params {
     let mut p = Params::default();
     for tok in cmdline.split_whitespace() {
@@ -462,6 +482,10 @@ pub fn parse_cmdline(cmdline: &str) -> Params {
             p.home = Spec::parse(v);
         } else if let Some(v) = tok.strip_prefix("horizon.homefs=") {
             p.homefs = v.to_string();
+        } else if let Some(v) = tok.strip_prefix("horizon.verity=") {
+            p.verity = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("horizon.veritydev=") {
+            p.verity_dev = Spec::parse(v);
         } else if let Some(v) = tok.strip_prefix("horizon.mode=") {
             p.mode = ModeChoice::parse(v);
         } else if let Some(v) = tok.strip_prefix("horizon.init=") {
@@ -492,6 +516,11 @@ pub const MASTER_KEY_SIZE: usize = 32;
 /// One fixed name: a boot opens exactly one Home layer.
 pub const HOME_MAPPER: &str = "horizon-home";
 
+/// The device-mapper name the dm-verity-verified base is exposed under,
+/// `/dev/mapper/<this>`. One fixed name: a boot opens exactly one verity device over the
+/// base, mounted read-only as the overlay lower in place of the raw partition.
+pub const BASE_MAPPER: &str = "horizon-base";
+
 /// The cryptsetup argv (after the program name) to open the encrypted Home layer at
 /// `container`, reading the 32-byte master from stdin, exposing it at
 /// `/dev/mapper/<mapper>`. Pure, so it is asserted with no cryptsetup; the inverse of the
@@ -511,6 +540,37 @@ pub fn luks_open_args(container: &Path, mapper: &str) -> Vec<String> {
 /// The cryptsetup argv to close the device-mapper node `mapper`.
 pub fn luks_close_args(mapper: &str) -> Vec<String> {
     vec!["luksClose".into(), mapper.into()]
+}
+
+/// The veritysetup argv (after the program name) to open the dm-verity device over the
+/// immutable base: verify `data_dev` (the base partition) against the Merkle tree on
+/// `hash_dev` anchored by `root_hash`, exposing the verified read-only base at
+/// `/dev/mapper/<mapper>`. The `veritysetup open <data> <name> <hash> <roothash>` form.
+///
+/// Pure, so it is asserted with no veritysetup, the same way [`luks_open_args`] is, and it
+/// is the inverse of keybuild's `verity::format`: the lowercase-hex root hash that build
+/// printed opens the tree it wrote. Unlike the LUKS master the root hash is a public trust
+/// anchor (it comes from the signed or measured loader config), so it is passed as an
+/// argument rather than fed on stdin.
+pub fn verity_open_args(
+    data_dev: &Path,
+    hash_dev: &Path,
+    mapper: &str,
+    root_hash: &str,
+) -> Vec<String> {
+    vec![
+        "open".into(),
+        data_dev.to_string_lossy().into_owned(),
+        mapper.into(),
+        hash_dev.to_string_lossy().into_owned(),
+        root_hash.into(),
+    ]
+}
+
+/// The veritysetup argv to close the device-mapper node `mapper` (tear down the verified
+/// base mapping). Paired with [`verity_open_args`].
+pub fn verity_close_args(mapper: &str) -> Vec<String> {
+    vec!["close".into(), mapper.into()]
 }
 
 /// The path the kernel exposes an opened LUKS volume at.
@@ -725,6 +785,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_cmdline_reads_the_verity_root_and_device() {
+        // The loader supplies the root hash (the trust anchor) and, optionally, where the
+        // hash device lives; the root hash present is what turns verification on.
+        let p = parse_cmdline(
+            "ro horizon.verity=deadbeefcafe horizon.veritydev=UUID=1234 console=tty0",
+        );
+        assert_eq!(p.verity.as_deref(), Some("deadbeefcafe"));
+        assert_eq!(p.verity_dev, Spec::Uuid("1234".into()));
+    }
+
+    #[test]
     fn parse_cmdline_defaults_to_the_horizon_labels() {
         let p = parse_cmdline("ro quiet console=tty0");
         assert_eq!(p.base, Spec::Label("HORIZON-BASE".into()));
@@ -733,6 +804,10 @@ mod tests {
         // explicit command line.
         assert_eq!(p.home, Spec::Label("HORIZON-HOME".into()));
         assert_eq!(p.homefs, "ext4");
+        // No verity token: the base is mounted unverified, but the hash device still
+        // defaults to its own label for when a loader does supply a root hash.
+        assert_eq!(p.verity, None);
+        assert_eq!(p.verity_dev, Spec::Label("HORIZON-VERITY".into()));
         assert_eq!(p.mode, ModeChoice::Auto);
         assert_eq!(p.init, PathBuf::from(DEFAULT_INIT));
         assert_eq!(p.init_args, ["boot"]);
@@ -760,6 +835,33 @@ mod tests {
         assert_eq!(
             mapper_path("horizon-home"),
             Path::new("/dev/mapper/horizon-home")
+        );
+    }
+
+    #[test]
+    fn verity_open_args_pass_the_root_hash_as_a_public_argument() {
+        let args = verity_open_args(
+            Path::new("/dev/disk/by-label/HORIZON-BASE"),
+            Path::new("/dev/disk/by-partlabel/HORIZON-VERITY"),
+            BASE_MAPPER,
+            "abc123",
+        );
+        // `veritysetup open <data> <name> <hash> <roothash>`: the root hash is the trailing
+        // positional argument, a public trust anchor, never fed on stdin the way the LUKS
+        // master is. The verified base is exposed at the fixed base mapper name.
+        assert_eq!(
+            args,
+            vec![
+                "open",
+                "/dev/disk/by-label/HORIZON-BASE",
+                "horizon-base",
+                "/dev/disk/by-partlabel/HORIZON-VERITY",
+                "abc123",
+            ]
+        );
+        assert_eq!(
+            verity_close_args("horizon-base"),
+            vec!["close", "horizon-base"]
         );
     }
 

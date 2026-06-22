@@ -46,6 +46,26 @@ fn run() -> init::Result<()> {
     // (data) partition and the encrypted Home layer are optional: their absence, or an
     // explicit Ghost request, means a stateless boot.
     let base = resolve(&params.base, &params.basefs)?.read_only();
+
+    // If the loader supplied a dm-verity root hash, verify the base before mounting it: open
+    // a verity device over the raw partition against the hash tree, anchored by that hash,
+    // and use the verified mapper as the read-only overlay lower in its place. A tampered
+    // base fails to open here rather than booting. Absent the token the base is mounted
+    // unverified, the same "boots anywhere" degradation a missing partition gets.
+    let base = match &params.verity {
+        Some(root_hash) => {
+            let hash = resolve(&params.verity_dev, "")?; // a raw hash device, no filesystem
+            let verified = verity_open(&base.dev, &hash.dev, BASE_MAPPER, root_hash)?;
+            eprintln!(
+                "horizon-init: opened dm-verity over the base {} (hash {})",
+                base.dev.display(),
+                hash.dev.display()
+            );
+            Source::new(verified, &params.basefs, MountFlags::default()).read_only()
+        }
+        None => base,
+    };
+
     let store_part = resolve(&params.data, &params.datafs).ok();
     let home_dev = resolve(&params.home, &params.homefs).ok();
 

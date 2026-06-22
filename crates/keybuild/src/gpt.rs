@@ -361,7 +361,8 @@ mod tests {
         // First partition at 1 MiB.
         assert_eq!(d.parts[0].first_lba, ALIGN_SECTORS);
         let align = ALIGN_SECTORS * SECTOR;
-        for (p, want) in d.parts.iter().zip([3 * 1024 * 1024u64, 5 * 1024 * 1024 + 17]) {
+        let wants = [3 * 1024 * 1024u64, 5 * 1024 * 1024 + 17];
+        for (p, want) in d.parts.iter().zip(wants) {
             // Each partition starts and ends on a 1 MiB boundary and holds at least its
             // image, with less than one alignment unit of slack.
             assert_eq!(p.first_lba % ALIGN_SECTORS, 0);

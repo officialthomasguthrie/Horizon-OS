@@ -35,36 +35,83 @@ fn run() -> init::Result<()> {
     let params = parse_cmdline(&cmdline);
     eprintln!("horizon-init: cmdline {cmdline:?}");
 
-    // The base must resolve; without the immutable OS there is nothing to boot. The
-    // data device is optional: its absence simply means Ghost mode.
+    // Bring up the kernel filesystems first, so the Key's partitions appear under /dev
+    // before anything is resolved or mounted. early_mounts is idempotent (the executor
+    // ignores EBUSY on the pseudo filesystems), so the plan running them again is fine.
+    execute(&Plan {
+        steps: early_mounts(),
+    })?;
+
+    // The base must resolve; without the immutable OS there is nothing to boot. The store
+    // (data) partition and the encrypted Home layer are optional: their absence, or an
+    // explicit Ghost request, means a stateless boot.
     let base = resolve(&params.base, &params.basefs)?.read_only();
-    let data = resolve(&params.data, &params.datafs).ok();
-    let mode = choose_mode(params.mode, data);
+    let store_part = resolve(&params.data, &params.datafs).ok();
+    let home_dev = resolve(&params.home, &params.homefs).ok();
 
     let scratch = PathBuf::from(SCRATCH);
     let layout = Layout::new(&scratch);
 
-    // In Home mode the identity store lives on the persistent data device, which the
-    // plan mounts as the overlay backing; carry it into the new root and point
-    // horizon boot at it. Ghost mode leaves the Key untouched, so no store is carried
-    // and horizon boot reports an empty session (a Foreign-Surface boot with no
-    // persistent identity is refined when the Key's partition layout is built).
-    let (carry, init_args) = match &mode {
-        Mode::Home(_) => (
-            vec![Carry {
-                from: layout.over.join("store"),
-                to: PathBuf::from(STORE_MOUNT),
-            }],
-            vec!["boot".into(), "--root".into(), STORE_MOUNT.into()],
-        ),
-        Mode::Ghost => (Vec::new(), params.init_args.clone()),
-    };
+    // A Home (Known Surface) boot persists into the encrypted Home layer; it needs both
+    // the store (to recover the master) and the Home layer (to unlock with it). Anything
+    // else, or an explicit Ghost, runs stateless on tmpfs.
+    let want_home = home_wanted(params.mode, store_part.is_some(), home_dev.is_some());
+
+    let mut carry = Vec::new();
+    let mut init_args = params.init_args.clone();
+    let mut mode = Mode::Ghost;
+
+    // Mount the store partition so the identity can be read before the encrypted layer is
+    // opened: read-write for a Home boot (the store accumulates generations), read-only
+    // for Ghost, so a Foreign Surface gets no writes (the Ghost read-only store handoff).
+    if let Some(part) = &store_part {
+        let src = if want_home {
+            part.clone()
+        } else {
+            part.clone().read_only()
+        };
+        execute(&Plan {
+            steps: vec![
+                Step::Mkdir(layout.data.clone()),
+                Step::Mount {
+                    source: src,
+                    target: layout.data.clone(),
+                },
+            ],
+        })?;
+
+        // Find the one identity store on the partition, carry it into the new root, and
+        // point horizon boot at it.
+        match boot::discover(&layout.data) {
+            Ok(store) => {
+                carry.push(Carry {
+                    from: store.clone(),
+                    to: PathBuf::from(STORE_MOUNT),
+                });
+                init_args = vec!["boot".into(), "--root".into(), STORE_MOUNT.into()];
+
+                // Home: recover the master from the store and open the encrypted Home
+                // layer with it. If the store cannot unlock, the boot fails here rather
+                // than assembling a root over a layer it could not decrypt.
+                if want_home {
+                    let master = recover_master(&store)?;
+                    let dev = home_dev
+                        .as_ref()
+                        .expect("home_wanted implies a Home device");
+                    let mapper = luks_open(&dev.dev, HOME_MAPPER, &master)?;
+                    mode = Mode::Home(Source::new(mapper, &params.homefs, MountFlags::default()));
+                }
+            }
+            Err(e) => eprintln!("horizon-init: no identity store on the data partition ({e})"),
+        }
+    }
 
     eprintln!(
         "horizon-init: {} mode, base {}",
-        match mode {
-            Mode::Home(_) => "home",
-            Mode::Ghost => "ghost",
+        if matches!(mode, Mode::Home(_)) {
+            "home (encrypted)"
+        } else {
+            "ghost"
         },
         base.dev.display()
     );
@@ -78,6 +125,37 @@ fn run() -> init::Result<()> {
         init_args,
     };
     execute(&plan(&recipe))
+}
+
+// Recover the 32-byte identity master from the store, the same key that opens the
+// encrypted Home layer. No authenticator is wired into the initramfs yet, so the master
+// is recovered from the console passphrase; a FIDO2 key at the initramfs (identity's
+// HardwareKey behind the fido2 feature, the touch-to-boot path) is a later refinement, as
+// is handing the recovered master to horizon boot so the session does not unlock a second
+// time after the pivot.
+#[cfg(target_os = "linux")]
+fn recover_master(store: &std::path::Path) -> init::Result<[u8; 32]> {
+    let (master, method) =
+        boot::unlock(store, None, read_passphrase).map_err(|e| init::Error::Boot(e.to_string()))?;
+    eprintln!(
+        "horizon-init: unlocked the Home layer via {}",
+        method.label()
+    );
+    Ok(master)
+}
+
+// Read the store passphrase from the console. Echo suppression is a later refinement; for
+// now the line is read plainly, which the eye-verify at boot will surface.
+#[cfg(target_os = "linux")]
+fn read_passphrase() -> boot::Result<String> {
+    use std::io::Write;
+    eprint!("horizon passphrase: ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| boot::Error::Passphrase(e.to_string()))?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
 #[cfg(not(target_os = "linux"))]

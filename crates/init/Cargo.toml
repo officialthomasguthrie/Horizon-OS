@@ -28,6 +28,10 @@ thiserror.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["mount", "fs", "process"] }
 libc = "0.2"
+# The initramfs binary recovers the identity master from the store (discover + unlock)
+# to open the encrypted Home layer before assembling the overlay. Only the Linux init
+# path uses it, so the dependency is Linux-only and the library stays free of it.
+boot = { path = "../boot" }
 
 [dev-dependencies]
 tempfile.workspace = true

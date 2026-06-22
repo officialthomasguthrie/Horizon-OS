@@ -11,12 +11,17 @@
 //! layer is where this machine's state goes. What that layer is made of is the whole
 //! Home-vs-Ghost decision:
 //!
-//! - [`Mode::Home`] (a Known Surface): the writable layer is a persistent device, so
-//!   OS state survives a power-off.
+//! - [`Mode::Home`] (a Known Surface): the writable layer is the LUKS2-encrypted Home
+//!   partition, opened with the identity master (recovered from the store with a touch
+//!   or a passphrase), so OS state survives a power-off but is encrypted at rest.
 //! - [`Mode::Ghost`] (a Foreign Surface): the writable layer is tmpfs in RAM, so the
 //!   machine writes nothing outside memory and the session is gone on power-off.
 //!
-//! The base is read-only in both modes; only the writable layer differs.
+//! The base is read-only in both modes; only the writable layer differs. The identity
+//! store lives on its own plain partition (its confidentiality is the Lifestream's own
+//! object encryption), read in both modes to boot the identity, read-only in Ghost so a
+//! Foreign Surface is never written to. Splitting it off the encrypted layer is what lets
+//! the master be recovered before the layer that master unlocks is opened.
 //!
 //! The honest split is the one the rest of Horizon uses. The *policy* of a boot, what
 //! to mount, in what order, where, the mode decision, the final pivot-and-exec, is
@@ -127,8 +132,9 @@ impl Source {
 /// What the writable overlay layer is made of, the Home-vs-Ghost decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    /// A Known Surface: a persistent device carries the writable layer, so OS state
-    /// survives a power-off. The device also holds the identity store.
+    /// A Known Surface: the decrypted Home layer (the LUKS2 partition, already opened with
+    /// the master) backs the writable overlay, so OS state survives a power-off encrypted
+    /// at rest. The identity store sits on its own plain partition, not here.
     Home(Source),
     /// A Foreign Surface: the writable layer is tmpfs in RAM, so nothing is written
     /// to the Key or the host and the session is gone on power-off.
@@ -147,14 +153,17 @@ pub struct Carry {
 }
 
 /// The fixed mountpoints under the scratch directory. `plan` lays the root out here
-/// and the binary reads the same layout to find, e.g., the store on the data device.
+/// and the binary reads the same layout to find the store on the data partition.
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub scratch: PathBuf,
     /// The immutable base, mounted read-only (the overlay lower).
     pub lower: PathBuf,
-    /// The writable layer's backing filesystem (a device or tmpfs), holding the
-    /// upper and work directories overlay requires to live on one filesystem.
+    /// The plain data partition holding the identity store, mounted so the master can be
+    /// recovered before the encrypted Home layer is opened.
+    pub data: PathBuf,
+    /// The writable layer's backing filesystem (the decrypted Home layer or tmpfs),
+    /// holding the upper and work directories overlay requires to live on one filesystem.
     pub over: PathBuf,
     pub upper: PathBuf,
     pub work: PathBuf,
@@ -168,6 +177,7 @@ impl Layout {
         let over = scratch.join("over");
         Layout {
             lower: scratch.join("lower"),
+            data: scratch.join("data"),
             upper: over.join("upper"),
             work: over.join("work"),
             root: scratch.join("root"),
@@ -175,6 +185,15 @@ impl Layout {
             scratch,
         }
     }
+}
+
+/// Whether to boot Home (encrypted persistence): the request is not an explicit Ghost,
+/// and both the store partition (to recover the master) and the encrypted Home layer (to
+/// unlock with it) are present. Anything else runs stateless on tmpfs, the same
+/// "boots anywhere" degradation [`choose_mode`] applies to a missing data device, now
+/// extended to a missing Home layer. Pure, so the policy is tested with no devices.
+pub fn home_wanted(choice: ModeChoice, has_store: bool, has_home: bool) -> bool {
+    !matches!(choice, ModeChoice::Ghost) && has_store && has_home
 }
 
 /// Everything the init needs to assemble the real root and hand off. The runtime
@@ -754,6 +773,19 @@ mod tests {
         assert_eq!(choose_mode(ModeChoice::Auto, None), Mode::Ghost);
         // Home with no persistent device degrades to Ghost rather than failing.
         assert_eq!(choose_mode(ModeChoice::Home, None), Mode::Ghost);
+    }
+
+    #[test]
+    fn home_wanted_needs_the_store_the_layer_and_not_ghost() {
+        // Encrypted Home needs both partitions and a non-Ghost request.
+        assert!(home_wanted(ModeChoice::Auto, true, true));
+        assert!(home_wanted(ModeChoice::Home, true, true));
+        // An explicit Ghost never persists, even with both present.
+        assert!(!home_wanted(ModeChoice::Ghost, true, true));
+        // Missing either partition degrades to a stateless boot.
+        assert!(!home_wanted(ModeChoice::Auto, true, false));
+        assert!(!home_wanted(ModeChoice::Auto, false, true));
+        assert!(!home_wanted(ModeChoice::Home, false, false));
     }
 }
 

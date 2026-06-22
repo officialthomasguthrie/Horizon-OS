@@ -16,6 +16,10 @@ pub enum Error {
     /// resolve to a present block device.
     #[error("resolve {0}: no such device")]
     Resolve(String),
+    /// A boot-time identity step failed (store discovery, master recovery): the message
+    /// from the boot crate, surfaced on the console so a failed unlock says why.
+    #[error("identity: {0}")]
+    Boot(String),
 }
 
 #[cfg(target_os = "linux")]

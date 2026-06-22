@@ -29,6 +29,16 @@ pub enum Error {
     /// A partition image the disk assembly needs has not been built yet.
     #[error("partition image not found (build it first): {0}")]
     NoImage(PathBuf),
+    /// A file or directory name placed in the ESP is not a valid 8.3 short name (the only
+    /// form the minimal FAT writer emits): too long, an empty base, or an illegal character.
+    #[error("not a valid 8.3 short name: {0}")]
+    BadName(String),
+    /// The ESP contents do not fit in the partition: more clusters are needed than it holds.
+    #[error("ESP contents do not fit: need {needed} clusters, partition holds {available}")]
+    EspFull { needed: u64, available: u64 },
+    /// The ESP partition is too small to format as a valid FAT16/FAT32 filesystem.
+    #[error("ESP is too small to format as FAT: {0} bytes")]
+    EspTooSmall(u64),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

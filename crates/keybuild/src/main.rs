@@ -10,8 +10,10 @@
 // dm-verity hash tree over the base into base.verity and prints the root hash that anchors
 // it. --home builds the encrypted Home writable layer (home.img, a LUKS2 container) keyed
 // by the 32-byte master in --home-keyfile, so a Home Surface persists encrypted at rest.
-// --disk assembles the base, data, and Home partitions into one bootable GPT disk (key.img),
-// building the data and Home partitions too, so it needs --home-keyfile.
+// --esp builds the FAT EFI System Partition (esp.img) with the /EFI/BOOT skeleton, the
+// partition firmware reads the bootloader from. --disk assembles the ESP, base, data, and
+// Home partitions into one bootable GPT disk (key.img), building the ESP, data, and Home
+// partitions too, so it needs --home-keyfile.
 // The build logic is in the keybuild library, tested there; this is the thin CLI over it.
 
 use std::path::PathBuf;
@@ -28,6 +30,7 @@ struct Args {
     verity: bool,
     home: bool,
     home_keyfile: Option<PathBuf>,
+    esp: bool,
     disk: bool,
 }
 
@@ -38,7 +41,7 @@ fn main() -> ExitCode {
             "usage: horizon-keybuild --out <dir> [--bin <path>]... \
              [--kver <version> --module <name>...] [--modules-root <dir>] \
              [--firmware <path>]... [--firmware-root <dir>] [--verity] \
-             [--home --home-keyfile <32-byte-master>] [--disk]"
+             [--home --home-keyfile <32-byte-master>] [--esp] [--disk]"
         );
         return ExitCode::FAILURE;
     };
@@ -56,9 +59,10 @@ fn main() -> ExitCode {
     }
     let verity = parsed.verity;
     let disk = parsed.disk;
-    // The assembled disk carries the encrypted Home partition, so --disk needs the master
-    // too; build the Home layer whenever either flag asks for it.
+    // The assembled disk carries the encrypted Home and ESP partitions, so --disk needs the
+    // master too; build the Home layer and the ESP whenever either flag asks for it.
     let home = parsed.home || disk;
+    let esp = parsed.esp || disk;
     let home_keyfile = parsed.home_keyfile;
 
     match keybuild::build_base(&spec) {
@@ -121,9 +125,25 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            // The FAT EFI System Partition with its /EFI/BOOT skeleton, the partition firmware
+            // reads the bootloader from.
+            if esp {
+                match keybuild::build_esp(&spec) {
+                    Ok(p) => println!(
+                        "esp: built {} ({} MiB FAT, label {})",
+                        p.display(),
+                        spec.esp_size_mb,
+                        keybuild::ESP_LABEL
+                    ),
+                    Err(e) => {
+                        eprintln!("horizon-keybuild: esp: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             // Assemble the partitions into a bootable GPT disk. The disk carries the plain
-            // data store partition too, so build it here; the base and the Home layer are
-            // already built above.
+            // data store partition too, so build it here; the base, the Home layer, and the
+            // ESP are already built above.
             if disk {
                 if let Err(e) = keybuild::build_data(&spec) {
                     eprintln!("horizon-keybuild: data: {e}");
@@ -131,8 +151,9 @@ fn main() -> ExitCode {
                 }
                 match keybuild::build_disk(&spec) {
                     Ok(p) => println!(
-                        "disk: built {} (GPT: {} / {} / {})",
+                        "disk: built {} (GPT: {} / {} / {} / {})",
                         p.display(),
+                        keybuild::ESP_LABEL,
                         spec.base_label,
                         spec.data_label,
                         keybuild::HOME_LABEL
@@ -164,6 +185,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut verity = false;
     let mut home = false;
     let mut home_keyfile = None;
+    let mut esp = false;
     let mut disk = false;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -178,6 +200,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--verity" => verity = true,
             "--home" => home = true,
             "--home-keyfile" => home_keyfile = Some(PathBuf::from(it.next()?)),
+            "--esp" => esp = true,
             "--disk" => disk = true,
             _ => return None,
         }
@@ -193,6 +216,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         verity,
         home,
         home_keyfile,
+        esp,
         disk,
     })
 }

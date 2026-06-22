@@ -36,9 +36,17 @@
 //! rest (see [`mod@luks`]). Unlike verity this shells out to `cryptsetup`, because LUKS2's
 //! format is complex and security-critical and the kernel's `dm-crypt` open is testable
 //! here, so the whole round-trip is proven for real in the container rather than matched
-//! byte-for-byte. The bootloader comes next.
+//! byte-for-byte.
+//!
+//! [`build_esp`] builds the one partition UEFI firmware reads directly: a FAT EFI System
+//! Partition (`esp.img`) holding the bootloader, kernel, and initramfs. Like verity and the
+//! GPT it owns the format (a minimal FAT16/FAT32 writer, see [`mod@fat`]) rather than
+//! shelling out, because the container has no `mkfs.fat`; it is proven by loop-mounting the
+//! self-built ESP as `vfat` in the container. [`build_disk`] then lays the ESP, base, data,
+//! and Home images side by side under one GPT into a bootable `key.img` (see [`mod@gpt`]).
 
 mod error;
+pub mod fat;
 pub mod gpt;
 pub mod luks;
 pub mod verity;
@@ -71,6 +79,13 @@ pub const VERITY_IMAGE: &str = "base.verity";
 /// container holding the OverlayFS upper, keyed by the identity master.
 pub const HOME_IMAGE: &str = "home.img";
 
+/// The EFI System Partition image's filename: a FAT filesystem firmware reads the bootloader,
+/// kernel, and initramfs from.
+pub const ESP_IMAGE: &str = "esp.img";
+
+/// The partition label (GPT PARTLABEL) and FAT volume label of the ESP.
+pub const ESP_LABEL: &str = "HORIZON-ESP";
+
 /// The assembled bootable disk's filename: a GPT image with the base, data, and Home
 /// partitions laid side by side, the artifact a bootloader and a kernel are written onto.
 pub const DISK_IMAGE: &str = "key.img";
@@ -93,6 +108,10 @@ pub struct KeySpec {
     /// the data partition because it holds the bulk OS state; the LUKS2 header takes a
     /// fixed ~16 MiB off the top, so a tiny value leaves little usable space.
     pub home_size_mb: u64,
+    /// The size of the FAT EFI System Partition image, in mebibytes. At or above 64 MiB the
+    /// ESP is formatted FAT32 (the firmware-friendly default); below it, FAT16. Holds the
+    /// bootloader, kernel, and initramfs, so the default leaves room for them.
+    pub esp_size_mb: u64,
     /// The boot mode the command line requests (Auto picks Home or Ghost at boot).
     pub mode: ModeChoice,
     pub os_name: String,
@@ -132,6 +151,7 @@ impl KeySpec {
             datafs: "ext4".to_string(),
             data_size_mb: 64,
             home_size_mb: 256,
+            esp_size_mb: 128,
             mode: ModeChoice::Auto,
             os_name: "Horizon OS".to_string(),
             os_id: "horizon".to_string(),
@@ -358,6 +378,33 @@ pub fn build_verity(spec: &KeySpec) -> Result<VerityArtifact> {
     })
 }
 
+/// Build the FAT EFI System Partition image at `<out>/esp.img`, sized per the spec
+/// ([`KeySpec::esp_size_mb`]) and holding `tree`, the bootloader/kernel/initramfs to lay into
+/// it. The FAT format is owned in pure Rust ([`mod@fat`]), so this writes the image directly
+/// with no `mkfs.fat`, and the result is reproducible. Returns the image path. The kernel and
+/// initramfs files are added by later steps; [`build_esp`] lays a default skeleton.
+pub fn build_esp_with(spec: &KeySpec, tree: &fat::Dir) -> Result<PathBuf> {
+    std::fs::create_dir_all(&spec.out)?;
+    let out = spec.out.join(ESP_IMAGE);
+    let bytes = fat::format(
+        spec.esp_size_mb * 1024 * 1024,
+        tree,
+        &fat::Params::for_label(ESP_LABEL),
+    )?;
+    std::fs::write(&out, &bytes)?;
+    Ok(out)
+}
+
+/// Build the ESP with the default skeleton: the `/EFI/BOOT` directory the removable-media
+/// bootloader path lives in, so the partition is a valid, mountable FAT volume with the
+/// directory structure a bootloader is later written into. Once the bootloader, kernel, and
+/// initramfs exist, the step that builds them passes a populated tree to [`build_esp_with`].
+pub fn build_esp(spec: &KeySpec) -> Result<PathBuf> {
+    let mut tree = fat::Dir::new();
+    tree.mkdir("EFI/BOOT")?;
+    build_esp_with(spec, &tree)
+}
+
 /// A partition to place on the assembled disk: the image file that fills it, its GPT type
 /// GUID, and its partition name (the PARTLABEL). [`write_disk`] reads each image's size,
 /// lays the partitions out under a GPT, and copies the images into place.
@@ -436,16 +483,23 @@ pub fn write_disk(out: &Path, parts: &[DiskPart]) -> Result<Vec<Placement>> {
     Ok(placements)
 }
 
-/// Assemble a Key's filesystems into a bootable GPT disk at `<out>/key.img`: the immutable
-/// base, the plain data store, and the encrypted Home layer, written as the HORIZON-BASE,
-/// HORIZON-DATA, and HORIZON-HOME partitions the init resolves by label. Each must already
-/// be built ([`build_base`], [`build_data`], [`build_home`]); a missing image is an error.
-/// The ESP holding the bootloader, kernel, and initramfs is added as a fourth partition
-/// once those exist. All three carry the generic Linux filesystem type GUID; they are told
-/// apart by their labels, not their types.
+/// Assemble a Key's filesystems into a bootable GPT disk at `<out>/key.img`: the FAT ESP, the
+/// immutable base, the plain data store, and the encrypted Home layer, written as the
+/// HORIZON-ESP, HORIZON-BASE, HORIZON-DATA, and HORIZON-HOME partitions. The ESP is partition
+/// one (the conventional place firmware looks) and carries the EFI System Partition type GUID
+/// so firmware recognizes it; the other three carry the generic Linux filesystem type GUID
+/// and are told apart by their labels, which is how `init` resolves them. Each image must
+/// already be built ([`build_esp`], [`build_base`], [`build_data`], [`build_home`]); a missing
+/// one is an error.
 pub fn build_disk(spec: &KeySpec) -> Result<PathBuf> {
     let linux = gpt::Guid::parse(gpt::LINUX_FS_TYPE).expect("static type guid parses");
+    let esp = gpt::Guid::parse(gpt::ESP_TYPE).expect("static type guid parses");
     let parts = [
+        DiskPart {
+            image: spec.out.join(ESP_IMAGE),
+            type_guid: esp,
+            name: ESP_LABEL.to_string(),
+        },
         DiskPart {
             image: spec.out.join(BASE_IMAGE),
             type_guid: linux,
@@ -2071,8 +2125,8 @@ mod linux_tests {
 
     #[test]
     fn build_disk_places_each_filesystem_at_its_gpt_offset() {
-        // Assemble a real Key (squashfs base, ext4 data store, LUKS2 Home layer) into a GPT
-        // disk, then attach each partition at the offset write_disk reported and read it
+        // Assemble a real Key (FAT ESP, squashfs base, ext4 data store, LUKS2 Home layer) into
+        // a GPT disk, then attach each partition at the offset write_disk reported and read it
         // back: the kernel must find the right filesystem there. This proves the table's
         // offsets point at the images write_disk copied in, on the real formats the Key
         // uses. The GPT table's own validity is cross-checked against sgdisk in the
@@ -2082,10 +2136,13 @@ mod linux_tests {
         let mut spec = KeySpec::new(dir.path());
         spec.data_size_mb = 16;
         spec.home_size_mb = 32;
+        spec.esp_size_mb = 16;
 
         if build_or_skip(dir.path()).is_none() {
             return;
         }
+        // The ESP is owned pure Rust (no mkfs.fat), so it never skips for a missing tool.
+        build_esp(&spec).expect("build esp");
         match build_data(&spec) {
             Ok(_) => {}
             Err(Error::Missing(t)) => {
@@ -2108,9 +2165,17 @@ mod linux_tests {
             Err(e) => panic!("build home: {e}"),
         }
 
-        // write_disk is what build_disk calls; using it directly returns the placements.
+        // write_disk is what build_disk calls; using it directly returns the placements. The
+        // ESP is partition one with the EFI System Partition type, the rest carry the generic
+        // Linux type, the same order build_disk lays them.
         let linux = gpt::Guid::parse(gpt::LINUX_FS_TYPE).unwrap();
+        let esp = gpt::Guid::parse(gpt::ESP_TYPE).unwrap();
         let parts = [
+            DiskPart {
+                image: spec.out.join(ESP_IMAGE),
+                type_guid: esp,
+                name: ESP_LABEL.to_string(),
+            },
             DiskPart {
                 image: spec.out.join(BASE_IMAGE),
                 type_guid: linux,
@@ -2129,10 +2194,10 @@ mod linux_tests {
         ];
         let disk = spec.out.join(DISK_IMAGE);
         let placed = write_disk(&disk, &parts).expect("assemble the GPT disk");
-        assert_eq!(placed.len(), 3);
+        assert_eq!(placed.len(), 4);
 
-        // blkid each partition at its GPT offset: the base is a squashfs, the data store is
-        // a labeled ext4, the Home layer is a LUKS2 container.
+        // blkid each partition at its GPT offset: the ESP is a vfat filesystem, the base a
+        // squashfs, the data store a labeled ext4, the Home layer a LUKS2 container.
         let mut found = Vec::new();
         for p in &placed {
             let Some(dev) = losetup_off(&disk, p.offset, p.size) else {
@@ -2144,19 +2209,96 @@ mod linux_tests {
         }
 
         assert!(
-            found[0].1.contains("squashfs"),
-            "base not at its offset: {}",
+            found[0].1.contains("vfat"),
+            "esp not at its offset: {}",
             found[0].1
         );
         assert!(
-            found[1].1.contains("ext4") && found[1].1.contains("HORIZON-DATA"),
-            "data store not at its offset: {}",
+            found[1].1.contains("squashfs"),
+            "base not at its offset: {}",
             found[1].1
         );
         assert!(
-            found[2].1.contains("crypto_LUKS"),
-            "Home layer not at its offset: {}",
+            found[2].1.contains("ext4") && found[2].1.contains("HORIZON-DATA"),
+            "data store not at its offset: {}",
             found[2].1
         );
+        assert!(
+            found[3].1.contains("crypto_LUKS"),
+            "Home layer not at its offset: {}",
+            found[3].1
+        );
+    }
+
+    // Mount one of our FAT images read-only as vfat, returning false (with the reason printed)
+    // where mounting is not permitted, so the test skips rather than fails on a restricted host.
+    fn mount_vfat(dev: &str, mnt: &Path) -> bool {
+        let out = Command::new("mount")
+            .args(["-t", "vfat", "-o", "ro"])
+            .arg(dev)
+            .arg(mnt)
+            .output()
+            .expect("spawn mount");
+        if out.status.success() {
+            return true;
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("Permission denied") || err.contains("not permitted") {
+            eprintln!("skipping: mounting vfat not permitted here ({err})");
+            false
+        } else {
+            panic!("mount esp: {err}");
+        }
+    }
+
+    #[test]
+    fn esp_mounts_as_vfat_and_files_read_back() {
+        // The kernel's own FAT driver is the cross-check on the pure-Rust writer (the analog of
+        // the GPT sgdisk check and verity's veritysetup check): build an ESP with a known tree,
+        // loop-mount it as vfat, and read the files back byte-for-byte. Both sizes are
+        // exercised, a small one (FAT16, the fixed-root-region path) and a large one (FAT32,
+        // the root-cluster-chain path), so both code paths are proven against the kernel. Skips
+        // where losetup or mounting is not permitted.
+        for size_mb in [16u64, 96u64] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut spec = KeySpec::new(dir.path());
+            spec.esp_size_mb = size_mb;
+
+            // A tree that spans subdirectories and multi-cluster files, the shape a real ESP
+            // (bootloader under /EFI/BOOT, a kernel and initramfs at the root) has.
+            let boot = b"this stands in for the bootloader".to_vec();
+            let vmlinuz = vec![0xABu8; 4096 * 5 + 123];
+            let initrd = vec![0xCDu8; 300_000];
+            let mut tree = fat::Dir::new();
+            tree.insert_file("EFI/BOOT/BOOTX64.EFI", boot.clone())
+                .unwrap();
+            tree.insert_file("VMLINUZ", vmlinuz.clone()).unwrap();
+            tree.insert_file("INITRD.IMG", initrd.clone()).unwrap();
+            let img = build_esp_with(&spec, &tree).expect("build esp");
+
+            let size = std::fs::metadata(&img).unwrap().len();
+            let Some(dev) = losetup_off(&img, 0, size) else {
+                eprintln!("skipping: losetup not permitted here");
+                return;
+            };
+            let mnt = dir.path().join("mnt");
+            std::fs::create_dir_all(&mnt).unwrap();
+            if !mount_vfat(&dev, &mnt) {
+                losetup_d(&dev);
+                return;
+            }
+
+            // FAT lookup is case-insensitive, so the uppercase 8.3 paths open regardless of how
+            // the vfat driver displays short names.
+            let read_boot = std::fs::read(mnt.join("EFI/BOOT/BOOTX64.EFI"));
+            let read_vmlinuz = std::fs::read(mnt.join("VMLINUZ"));
+            let read_initrd = std::fs::read(mnt.join("INITRD.IMG"));
+            umount(&mnt);
+            losetup_d(&dev);
+
+            assert_eq!(read_boot.unwrap(), boot, "{size_mb} MiB ESP: bootloader");
+            assert_eq!(read_vmlinuz.unwrap(), vmlinuz, "{size_mb} MiB ESP: kernel");
+            assert_eq!(read_initrd.unwrap(), initrd, "{size_mb} MiB ESP: initramfs");
+        }
     }
 }

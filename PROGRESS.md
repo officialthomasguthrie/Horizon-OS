@@ -1539,6 +1539,41 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   with `udev device never initialized`, because it requires udev to have processed each device (a
   `/run/udev/data` entry a udev daemon writes) and the minimal boot runs none, so input bring-up needs
   a udev coldplug, not just the device nodes. Built and tested on darwin and in the Linux container.
+- Phase 0 step (5) on-screen input via a udev coldplug (`compositor` `softdrm` + `horizon` boot +
+  the Key build): the desktop now takes keyboard and pointer input on a real screen, the last piece
+  of the on-screen interactive eye-verify. The blocker the keyboard-data step surfaced was real and
+  deeper than wiring up device nodes: libinput refuses every input device with `udev device never
+  initialized` because it gates on udev having processed the device (the `/run/udev/data` entry a
+  udev daemon writes), and the minimal Horizon boot runs no udev daemon, so neither libinput backend
+  (udev-discovery or explicit-path) gets a usable device. Two changes fix it. (1) `softdrm` opens
+  libinput through the path backend (`Libinput::new_from_path` + `path_add_device` over the
+  `/dev/input/event*` nodes devtmpfs creates, opened through the libseat session) instead of the udev
+  backend: the udev backend filters on the `ID_INPUT`/`ID_SEAT` properties udev rules set, which
+  assumes a udevd-managed system the minimal boot is not, while the path backend adds the explicit
+  nodes regardless of seat tagging (one-shot at startup; input hotplug rides with the deferred
+  multi-output/hotplug hardening). (2) `horizon boot` runs a udev coldplug before the session
+  (`udev_coldplug`, the post-pivot init's device bring-up): it starts systemd-udevd (the udevadm
+  multi-call binary run under that argv[0], `--resolve-names=never` so it needs no nss) then
+  `udevadm trigger`/`settle`, which writes the device-db entries that mark each device initialized,
+  the gate libinput checks even via the path backend; it is best-effort, logging and continuing so a
+  base without udevadm degrades input rather than breaking the boot. The Key carries udevadm
+  (`--bin /usr/bin/udevadm`, with its ldd closure) and the udev rules (`--stage /lib/udev/rules.d`,
+  the new staging), so udevd has what it needs in the base. `softdrm` also logs how many input
+  devices it added, the operational signal that input came up. On the usual split the compositing and
+  seat routing are already headless-tested; only the device bring-up is new and eye-verified.
+  Eye-verified in qemu-system-aarch64 (Ghost boot, `-device virtio-keyboard-pci -device
+  virtio-tablet-pci`, input driven over QMP `input-send-event`, captured with `screendump`): with the
+  coldplug there are no libinput errors and 3 input devices are added; typing `browser` into the Aura
+  palette live-filtered the Glass desktop to that one principal (the palette showing the typed line, a
+  caret, and `filtering 'browser': 1 principal`), proving the keyboard end to end; and clicking the
+  browser `sever` button routed the press through the shell to the kill switch, which reached
+  `Glass::sever` and the revoke and failed only with `Read-only file system` because a Ghost boot
+  mounts the store read-only, proving the pointer hit-tests and routes (a writable Home boot is what
+  makes a clicked or typed `sever` visibly take, still open with the dm-crypt Home boot and one-command
+  identity provisioning). One QMP gotcha worth recording: a lone `btn` event has no device to land on
+  when the only pointer is the absolute tablet, so the button must ride in the same `input-send-event`
+  batch as the `abs` position. Built and compile-checked from the Linux container; eye-verified in
+  qemu-system-aarch64.
 
 ## Next
 

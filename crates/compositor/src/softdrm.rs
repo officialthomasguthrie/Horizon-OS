@@ -301,11 +301,16 @@ fn setup(loop_handle: LoopHandle<'static, SoftBackend>) -> Result<SoftBackend> {
         LibSeatSession::new().map_err(|e| Error::Init(format!("libseat session: {e}")))?;
     let seat_name = session.seat();
 
-    // libinput, sharing the session so it opens input devices through the seat.
-    let mut libinput = Libinput::new_with_udev(LibinputSessionInterface::from(session.clone()));
-    libinput
-        .udev_assign_seat(&seat_name)
-        .map_err(|_| Error::Init("libinput seat assign failed".into()))?;
+    // libinput, sharing the session so it opens input devices through the seat. The
+    // minimal Horizon boot runs no udev daemon, so libinput's udev backend would find
+    // nothing (it filters devices on the ID_INPUT/ID_SEAT properties udev rules set).
+    // Use the path backend instead: enumerate the evdev nodes devtmpfs creates and add
+    // each directly, opened through libseat, so it needs neither real root nor udevd.
+    // Discovery is one-shot at startup (input hotplug rides with the deferred multi-
+    // output/hotplug hardening), and on a single-seat Key opening every event device is
+    // exactly right.
+    let mut libinput = Libinput::new_from_path(LibinputSessionInterface::from(session.clone()));
+    add_input_devices(&mut libinput);
     let libinput_source = LibinputInputBackend::new(libinput.clone());
 
     // Session changes: a VT switch away pauses the device and input; coming back
@@ -426,6 +431,38 @@ fn setup(loop_handle: LoopHandle<'static, SoftBackend>) -> Result<SoftBackend> {
         pending: false,
         active: true,
     })
+}
+
+// Add every evdev node devtmpfs created (`/dev/input/event*`) to a path-backend
+// libinput context. Each is opened through the session interface (libseat), so no real
+// root and no udev daemon are needed. A node libinput rejects (not an input device) is
+// skipped, and an empty `/dev/input` (no input driver loaded) simply adds nothing.
+fn add_input_devices(libinput: &mut Libinput) {
+    let Ok(dir) = std::fs::read_dir("/dev/input") else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = dir
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("event"))
+        })
+        .collect();
+    paths.sort();
+    let mut added = 0;
+    for p in &paths {
+        if let Some(s) = p.to_str() {
+            // None means libinput could not add it (not an input device); harmless.
+            if libinput.path_add_device(s).is_some() {
+                added += 1;
+            } else {
+                eprintln!("compositor: input {s} not added");
+            }
+        }
+    }
+    eprintln!("compositor: {added} input device(s) added");
 }
 
 // The path of the KMS device to drive: the seat's primary GPU if udev names one,

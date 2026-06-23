@@ -2150,12 +2150,78 @@ fn boot_cmd(
 // without re-deriving from the passphrase. Each backend exists only in a build with
 // its feature; a build without it says how to get it instead of failing silently.
 fn launch_session(store: &Path, days: u64, nested: bool, master: [u8; 32]) -> Result<()> {
+    // Bring up udev before the session so libinput accepts the input devices.
+    udev_coldplug();
     if nested {
         launch_nested(store, days, master)
     } else {
         launch_drm(store, days, master)
     }
 }
+
+// Bring up udev so the compositor's libinput sees a usable keyboard and pointer. The
+// minimal boot runs no udev daemon, so the kernel's input devices are never marked
+// "initialized" in udev's database, and libinput refuses an uninitialized device
+// ("udev device never initialized") whichever way it is added. So start the daemon and
+// coldplug: re-emit the `add` uevent for every existing device and wait for udevd to
+// process them, which writes the /run/udev/data entries that mark each device
+// initialized (the gate libinput checks). systemd-udevd is the udevadm multi-call binary
+// under that argv[0], so it is run by forcing arg0 rather than shipping a second name.
+// Best-effort: every step logs and continues, so a base without udevadm, or a daemon
+// already running, degrades input rather than breaking the boot. This is the boot path's
+// job (it is the post-pivot init); the standalone `compositor` dev commands assume a
+// system that already runs udev.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        feature = "compositor-softdrm",
+        feature = "compositor-udev",
+        feature = "compositor-winit"
+    )
+))]
+fn udev_coldplug() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    let udevadm = "/usr/bin/udevadm";
+    if !Path::new(udevadm).exists() {
+        eprintln!("boot: no {udevadm}; input devices may be unavailable");
+        return;
+    }
+    // Start the daemon. --resolve-names=never keeps it from resolving rule user/group
+    // names through nss, which a minimal base has no libraries for. --daemon forks and
+    // returns, so status() just waits for that quick parent exit.
+    let started = Command::new(udevadm)
+        .arg0("systemd-udevd")
+        .args(["--daemon", "--resolve-names=never"])
+        .status();
+    match started {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!("boot: udevd exited {s}; input may be unavailable"),
+        Err(e) => {
+            eprintln!("boot: could not start udevd ({e}); input may be unavailable");
+            return;
+        }
+    }
+    // Coldplug: replay the add events for already-present devices, then wait for the
+    // queue to drain so the device db is written before the compositor opens libinput.
+    let _ = Command::new(udevadm)
+        .args(["trigger", "--action=add"])
+        .status();
+    let _ = Command::new(udevadm)
+        .args(["settle", "--timeout=10"])
+        .status();
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    any(
+        feature = "compositor-softdrm",
+        feature = "compositor-udev",
+        feature = "compositor-winit"
+    )
+)))]
+fn udev_coldplug() {}
 
 // Prefer the software backend when it is built in: it drives any KMS device with
 // no GPU, so it is the safe boot default for a Key that lands on unknown hardware

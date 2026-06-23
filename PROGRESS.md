@@ -1351,6 +1351,36 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   shim and boot the whole chain in QEMU (UEFI -> systemd-boot -> kernel -> horizon-init -> horizon
   boot -> the desktop), where the dm-verity/dm-crypt kernel opens and the init's orchestration get
   their eye-verification. Built and tested on darwin and in the Linux container.
+- Phase 0 step (5) boot bring-up, arch-correct bootloader name (`keybuild` crate): step (5) is the
+  eye-verify of the assembled Key on a real UEFI machine, and the build container can now run it,
+  qemu-system-aarch64 + AAVMF (edk2) firmware + a Debian arm64 kernel + systemd-boot installed, so
+  the chain is booted on the native aarch64 ISA (an x86-64 product still wants cross-compilation;
+  the chain is ISA-independent above the kernel). The first boot surfaced a real bug: the removable-
+  media bootloader path is architecture-specific. UEFI runs `/EFI/BOOT/BOOT<arch>.EFI` when no boot
+  entry is configured, and the UEFI spec fixes that name per machine type (`BOOTX64.EFI` for x86-64,
+  `BOOTAA64.EFI` for AArch64), so an aarch64 systemd-boot at the hardcoded `BOOTX64.EFI` is never
+  found by aarch64 firmware. `build_esp` now reads the name from the bootloader's own PE/COFF machine
+  type (`removable_efi_name`/`pe_machine`) instead of hardcoding it, the same correctness-by-
+  construction the loader config's cmdline round-trip uses: the filename cannot drift from the binary
+  it names, and a non-PE or unknown-architecture bootloader is refused (`NotAnEfiBinary`/
+  `UnknownEfiMachine`) rather than silently misnamed. `KeySpec` also gained `cmdline_extra`
+  (`horizon-keybuild --cmdline`): extra kernel command-line tokens appended to the loader entry's
+  `options` after the `horizon.*` core and the verity root, the loader's concern not the init's (a
+  serial `console=ttyAMA0` for the QEMU boot, `loglevel=`); `init`'s `parse_cmdline` ignores tokens
+  it does not know, so they reach the kernel without touching the boot policy. On the usual headless
+  split the pure parts are unit-tested on every host (`pe_machine` over crafted PE headers,
+  `removable_efi_name` mapping x64/aa64 and refusing a non-PE and an unknown machine, `cmdline_extra`
+  riding the options line and still parsing back through `init`), and the existing bootable-ESP
+  container test now builds its stand-in bootloader as a real PE so it reads back the arch name
+  through the kernel's FAT driver. Verified for real in the container: `horizon-keybuild --disk`
+  built an aarch64 Key whose AAVMF -> systemd-boot (loaded off `BOOTAA64.EFI`, the "Horizon OS" menu
+  with its timeout) -> kernel -> initramfs chain reached `horizon-init` as PID 1, which printed the
+  full command line (the `horizon.*` tokens plus `console=ttyAMA0`) before stopping at the partition
+  resolve, so the whole ESP/GPT/FAT/cpio/loader-config structure is proven end to end in QEMU. Left
+  next in step (5): module loading and by-partlabel resolution in `init` (the Debian kernel ships the
+  boot-path drivers as modules and a minimal initramfs has no udev), so it reaches and mounts the
+  partitions, then the overlay/`switch_root` into `horizon boot` and the desktop. Built and tested on
+  darwin and in the Linux container, eye-verified in qemu-system-aarch64.
 
 ## Next
 

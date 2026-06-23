@@ -186,9 +186,11 @@ pub struct KeySpec {
     /// together with `bootloader` makes [`build_esp`] lay a bootable ESP; both `None` lays the
     /// `/EFI/BOOT` skeleton (the reproducible default the pure tests use).
     pub kernel: Option<PathBuf>,
-    /// The UEFI bootloader to write at the removable path `/EFI/BOOT/BOOTX64.EFI`, the one
-    /// firmware runs with no boot entry configured: systemd-boot (`systemd-bootx64.efi`), or
-    /// shim for Secure Boot. An external artifact, so a host path.
+    /// The UEFI bootloader to write at the removable-media path firmware runs with no boot
+    /// entry configured: systemd-boot, or shim for Secure Boot. An external artifact, so a
+    /// host path. The exact filename (`/EFI/BOOT/BOOTX64.EFI`, `BOOTAA64.EFI`, ...) is fixed
+    /// by the UEFI spec per architecture and read from this binary's own PE machine type
+    /// ([`removable_efi_name`]), so it always matches the bootloader and never has to be set.
     pub bootloader: Option<PathBuf>,
     /// Extra EFI binaries to place under `/EFI/BOOT` by their file name (e.g. systemd-boot as
     /// shim's next stage when `bootloader` is shim). Each is written to `/EFI/BOOT/<filename>`.
@@ -199,6 +201,12 @@ pub struct KeySpec {
     pub verity_root: Option<String>,
     /// The systemd-boot menu timeout, in seconds, written into `loader.conf`.
     pub loader_timeout: u32,
+    /// Extra kernel command-line tokens appended to the loader entry's `options` line, after
+    /// the `horizon.*` tokens and the verity root: the loader's concern, not the init's
+    /// (`console=ttyAMA0` for a serial boot, `loglevel=`, ...). `init`'s `parse_cmdline`
+    /// ignores anything it does not recognize, so these reach the kernel without touching the
+    /// boot policy. Empty for a normal build.
+    pub cmdline_extra: Vec<String>,
 }
 
 impl KeySpec {
@@ -233,6 +241,7 @@ impl KeySpec {
             esp_efi: Vec::new(),
             verity_root: None,
             loader_timeout: 3,
+            cmdline_extra: Vec::new(),
         }
     }
 }
@@ -266,11 +275,16 @@ pub fn loader_conf(spec: &KeySpec) -> String {
 /// paths in the ESP, and the kernel command line. The command line is [`boot_cmdline`] plus a
 /// `horizon.verity=<roothash>` token when [`KeySpec::verity_root`] is set, the dm-verity trust
 /// anchor the loader hands the kernel (it comes from the signed or measured config, never the
-/// disk). Pure, so the exact line a Key boots with is asserted with no boot.
+/// disk), then any [`KeySpec::cmdline_extra`] tokens (a serial `console=`, ...). Pure, so the
+/// exact line a Key boots with is asserted with no boot.
 pub fn loader_entry(spec: &KeySpec) -> String {
     let mut options = boot_cmdline(spec);
     if let Some(root) = &spec.verity_root {
         options.push_str(&format!(" horizon.verity={root}"));
+    }
+    for tok in &spec.cmdline_extra {
+        options.push(' ');
+        options.push_str(tok);
     }
     format!("title   Horizon OS\nlinux   /{ESP_KERNEL}\ninitrd  /{ESP_INITRD}\noptions {options}\n")
 }
@@ -496,7 +510,8 @@ pub fn build_esp_with(spec: &KeySpec, tree: &fat::Dir) -> Result<PathBuf> {
 }
 
 /// Build the ESP. With a [`KeySpec::kernel`] and [`KeySpec::bootloader`] this lays a bootable
-/// EFI System Partition: the bootloader at the removable path `/EFI/BOOT/BOOTX64.EFI`, the
+/// EFI System Partition: the bootloader at the removable path `/EFI/BOOT/BOOT<arch>.EFI` (the
+/// name read from the bootloader's own machine type, see [`removable_efi_name`]), the
 /// kernel at [`ESP_KERNEL`] and the built initramfs ([`INITRAMFS_IMAGE`], which must already
 /// exist) at [`ESP_INITRD`], any [`KeySpec::esp_efi`] binaries under `/EFI/BOOT`, and the
 /// systemd-boot loader config ([`loader_conf`], [`loader_entry`]) carrying the boot command
@@ -532,8 +547,11 @@ fn populate_esp(
     insert_host_file(tree, ESP_INITRD, &initramfs)?;
 
     // The bootloader at the removable path firmware runs with no boot entry, plus any extra EFI
-    // binaries (e.g. systemd-boot as shim's next stage) under the same directory.
-    insert_host_file(tree, "EFI/BOOT/BOOTX64.EFI", bootloader)?;
+    // binaries (e.g. systemd-boot as shim's next stage) under the same directory. The removable
+    // filename is the UEFI spec's per-architecture default, read from the bootloader's own PE
+    // machine type so an aarch64 loader lands at BOOTAA64.EFI and an x86-64 one at BOOTX64.EFI.
+    let removable = removable_efi_name(bootloader)?;
+    insert_host_file(tree, &format!("EFI/BOOT/{removable}"), bootloader)?;
     for efi in &spec.esp_efi {
         let name = efi
             .file_name()
@@ -549,6 +567,47 @@ fn populate_esp(
         loader_entry(spec).into_bytes(),
     )?;
     Ok(())
+}
+
+/// The UEFI removable-media boot filename for a bootloader: the default name firmware loads
+/// from `/EFI/BOOT/` when no boot entry is configured. The UEFI spec fixes one name per
+/// machine architecture (`BOOTX64.EFI` for x86-64, `BOOTAA64.EFI` for AArch64, ...), and it
+/// must match the bootloader's own machine type or firmware will not run it. So the name is
+/// read from the binary's PE/COFF header rather than configured: it cannot drift from the
+/// bootloader it names, the same correctness-by-construction the loader config's
+/// cmdline round-trip uses. An unrecognized or non-PE binary is an error, not a wrong guess.
+pub fn removable_efi_name(bootloader: &Path) -> Result<&'static str> {
+    let bytes = std::fs::read(bootloader)?;
+    let machine =
+        pe_machine(&bytes).ok_or_else(|| Error::NotAnEfiBinary(bootloader.to_path_buf()))?;
+    // IMAGE_FILE_MACHINE_* constants paired with the UEFI default boot file names.
+    match machine {
+        0x8664 => Ok("BOOTX64.EFI"),     // AMD64 / x86-64
+        0xAA64 => Ok("BOOTAA64.EFI"),    // AArch64
+        0x014C => Ok("BOOTIA32.EFI"),    // i386 (32-bit x86)
+        0x01C2 => Ok("BOOTARM.EFI"),     // ARM Thumb-2 (32-bit)
+        0x5064 => Ok("BOOTRISCV64.EFI"), // RISC-V 64
+        other => Err(Error::UnknownEfiMachine(other)),
+    }
+}
+
+/// The PE/COFF machine type (`IMAGE_FILE_HEADER.Machine`) of a UEFI executable. A PE file
+/// opens with the "MZ" DOS stub, carries the byte offset of the "PE\0\0" signature at 0x3C,
+/// and the machine type is the `u16` immediately after that signature. Returns `None` if the
+/// bytes are not a PE file (no MZ, a bad PE offset, or no PE signature there). Pure byte
+/// handling, so it is unit-tested with crafted headers, no real bootloader needed.
+fn pe_machine(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
+        return None;
+    }
+    let pe_off = u32::from_le_bytes(bytes[0x3C..0x40].try_into().ok()?) as usize;
+    let sig_end = pe_off.checked_add(4)?;
+    if bytes.len() < sig_end + 2 || &bytes[pe_off..sig_end] != b"PE\0\0" {
+        return None;
+    }
+    Some(u16::from_le_bytes(
+        bytes[sig_end..sig_end + 2].try_into().ok()?,
+    ))
 }
 
 /// Read a host file and insert its bytes into `tree` at `dest`.
@@ -1176,6 +1235,76 @@ mod tests {
         assert_eq!(parsed.verity.as_deref(), Some("deadbeefcafe"));
         // The verity hash device defaults to its label, so the loader need not name it.
         assert_eq!(parsed.verity_dev, Spec::Label(VERITY_LABEL.to_string()));
+    }
+
+    #[test]
+    fn loader_entry_appends_extra_cmdline_tokens() {
+        let mut spec = KeySpec::new("/tmp/key");
+        spec.cmdline_extra = vec!["console=ttyAMA0".into(), "loglevel=7".into()];
+        let entry = loader_entry(&spec);
+        let options = entry
+            .lines()
+            .find_map(|l| l.strip_prefix("options "))
+            .expect("an options line");
+        // The extra tokens ride after the horizon.* core (a serial console for the QEMU boot),
+        // and the init parser still reads the core back, ignoring the tokens it does not know.
+        assert!(options.contains("console=ttyAMA0"), "{options}");
+        assert!(options.contains("loglevel=7"), "{options}");
+        let parsed = parse_cmdline(options);
+        assert_eq!(parsed.mode, ModeChoice::Auto);
+        assert_eq!(parsed.base, Spec::Label(BASE_LABEL.to_string()));
+    }
+
+    // A minimal PE/COFF header carrying just the machine type, enough for pe_machine to read:
+    // the "MZ" stub, the PE-signature offset at 0x3C, then "PE\0\0" and the machine u16.
+    fn fake_pe(machine: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 0x88];
+        b[0] = b'M';
+        b[1] = b'Z';
+        let pe_off: u32 = 0x80;
+        b[0x3C..0x40].copy_from_slice(&pe_off.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn removable_efi_name_follows_the_bootloaders_machine_type() {
+        // pe_machine reads IMAGE_FILE_HEADER.Machine; non-PE bytes have none.
+        assert_eq!(pe_machine(&fake_pe(0x8664)), Some(0x8664));
+        assert_eq!(pe_machine(&fake_pe(0xAA64)), Some(0xAA64));
+        assert_eq!(pe_machine(b"not a pe file at all"), None);
+        assert_eq!(pe_machine(&[]), None);
+
+        // removable_efi_name maps that machine type to the UEFI default boot filename, read off
+        // the binary on disk, so an aarch64 systemd-boot lands at BOOTAA64.EFI (the bug the QEMU
+        // boot surfaced) and an x86-64 one at BOOTX64.EFI, with no config to set wrong.
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, m: u16| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, fake_pe(m)).unwrap();
+            p
+        };
+        assert_eq!(
+            removable_efi_name(&write("x64.efi", 0x8664)).unwrap(),
+            "BOOTX64.EFI"
+        );
+        assert_eq!(
+            removable_efi_name(&write("aa64.efi", 0xAA64)).unwrap(),
+            "BOOTAA64.EFI"
+        );
+        // A non-PE bootloader is refused, not silently misnamed.
+        let bad = dir.path().join("bad.efi");
+        std::fs::write(&bad, b"garbage").unwrap();
+        assert!(matches!(
+            removable_efi_name(&bad),
+            Err(Error::NotAnEfiBinary(_))
+        ));
+        // A PE of an architecture UEFI defines no removable name for is an explicit error.
+        assert!(matches!(
+            removable_efi_name(&write("odd.efi", 0x1234)),
+            Err(Error::UnknownEfiMachine(0x1234))
+        ));
     }
 
     #[test]
@@ -2702,9 +2831,18 @@ mod linux_tests {
         spec.verity_root = Some("00112233445566778899aabbccddeeff".into());
 
         // Stand-in external artifacts plus a stand-in initramfs at the path build_initramfs
-        // writes, all multi-cluster so the cluster-chain path is exercised.
+        // writes, all multi-cluster so the cluster-chain path is exercised. The bootloader
+        // stand-in carries a real PE/COFF header with an x86-64 machine type, so
+        // removable_efi_name lands it at BOOTX64.EFI deterministically (independent of the host
+        // arch this test runs on), plus a payload tail to read back.
         let kernel = vec![0xA5u8; 200_000];
-        let loader = b"systemd-boot stand-in".to_vec();
+        let mut loader = vec![0u8; 0x88];
+        loader[0] = b'M';
+        loader[1] = b'Z';
+        loader[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        loader[0x80..0x84].copy_from_slice(b"PE\0\0");
+        loader[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        loader.extend_from_slice(&[0xC3u8; 150_000]);
         let initramfs = vec![0x5Au8; 150_000];
         std::fs::create_dir_all(&spec.out).unwrap();
         let kpath = dir.path().join("vmlinuz-host");

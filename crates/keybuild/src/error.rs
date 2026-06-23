@@ -37,6 +37,14 @@ pub enum Error {
     /// are needed, alongside the built initramfs, to write a loadable EFI System Partition.
     #[error("a bootable ESP needs both a kernel and a bootloader")]
     IncompleteEsp,
+    /// The bootloader given is not a PE/COFF EFI executable, so its machine type (which
+    /// fixes the removable-media boot filename, BOOTX64.EFI vs BOOTAA64.EFI) cannot be read.
+    #[error("not a PE/COFF EFI binary: {0}")]
+    NotAnEfiBinary(PathBuf),
+    /// The bootloader's PE machine type is not one UEFI defines a removable boot path for,
+    /// so the right `/EFI/BOOT/BOOT*.EFI` name is unknown.
+    #[error("unsupported EFI machine type {0:#06x}")]
+    UnknownEfiMachine(u16),
     /// The ESP contents do not fit in the partition: more clusters are needed than it holds.
     #[error("ESP contents do not fit: need {needed} clusters, partition holds {available}")]
     EspFull { needed: u64, available: u64 },

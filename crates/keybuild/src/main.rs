@@ -11,10 +11,11 @@
 // it. --home builds the encrypted Home writable layer (home.img, a LUKS2 container) keyed
 // by the 32-byte master in --home-keyfile, so a Home Surface persists encrypted at rest.
 // --esp builds the FAT EFI System Partition (esp.img). With --kernel and --bootloader it is a
-// loadable ESP: the bootloader (systemd-boot, or shim) at /EFI/BOOT/BOOTX64.EFI, the kernel and
-// the built initramfs at the root, any --esp-efi binaries under /EFI/BOOT, and the systemd-boot
-// loader config carrying the boot command line plus the dm-verity root hash from --verity (with
-// --loader-timeout setting the menu wait); with neither it lays the /EFI/BOOT skeleton. --disk
+// loadable ESP: the bootloader (systemd-boot, or shim) at the removable path /EFI/BOOT/BOOT<arch>.EFI
+// (BOOTAA64.EFI / BOOTX64.EFI, read from the bootloader's machine type), the kernel and the built
+// initramfs at the root, any --esp-efi binaries under /EFI/BOOT, and the systemd-boot loader config
+// carrying the boot command line plus the dm-verity root hash from --verity and any --cmdline tokens
+// (with --loader-timeout setting the menu wait); with neither it lays the /EFI/BOOT skeleton. --disk
 // assembles the ESP, base, the verity hash device (when --verity), data, and Home partitions
 // into one bootable GPT disk (key.img), building the ESP, data, and Home partitions too, so it
 // needs --home-keyfile. --initramfs builds the initramfs (initramfs.img, a gzip newc cpio) with
@@ -47,6 +48,7 @@ struct Args {
     bootloader: Option<PathBuf>,
     esp_efi: Vec<PathBuf>,
     loader_timeout: Option<u32>,
+    cmdline_extra: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -60,7 +62,7 @@ fn main() -> ExitCode {
              [--initramfs --init-bin <path> [--initramfs-bin <path>]... \
              [--initramfs-module <name>]...] \
              [--kernel <path> --bootloader <path> [--esp-efi <path>]... \
-             [--loader-timeout <secs>]]"
+             [--loader-timeout <secs>] [--cmdline <token>]...]"
         );
         return ExitCode::FAILURE;
     };
@@ -85,6 +87,7 @@ fn main() -> ExitCode {
     if let Some(t) = parsed.loader_timeout {
         spec.loader_timeout = t;
     }
+    spec.cmdline_extra = parsed.cmdline_extra;
     let verity = parsed.verity;
     let disk = parsed.disk;
     let initramfs = parsed.initramfs;
@@ -254,6 +257,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut bootloader = None;
     let mut esp_efi = Vec::new();
     let mut loader_timeout = None;
+    let mut cmdline_extra = Vec::new();
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -277,6 +281,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--bootloader" => bootloader = Some(PathBuf::from(it.next()?)),
             "--esp-efi" => esp_efi.push(PathBuf::from(it.next()?)),
             "--loader-timeout" => loader_timeout = Some(it.next()?.parse().ok()?),
+            "--cmdline" => cmdline_extra.push(it.next()?.clone()),
             _ => return None,
         }
     }
@@ -301,6 +306,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         bootloader,
         esp_efi,
         loader_timeout,
+        cmdline_extra,
     })
 }
 

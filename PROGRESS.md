@@ -1433,6 +1433,34 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   runs as the real init and reports the Key carries no identity yet. So the whole init orchestration
   is proven end to end through the pivot, short only of an identity store to boot into. Built and
   tested on darwin and in the Linux container, eye-verified in qemu-system-aarch64.
+- Phase 0 step (5) the boot chain proven through dm-verity and the identity unlock (eye-verify): a
+  fully assembled aarch64 Key now boots the whole chain in qemu-system-aarch64, with the two real
+  kernel opens the build container cannot test, dm-verity over the immutable base and the identity
+  unlock, both verified. The Key was built with `horizon-keybuild --disk --verity` (a five-partition
+  disk: the FAT ESP, the squashfs base, the dm-verity hash device, the ext4 data store, the LUKS2
+  Home layer) and provisioned with an identity store on the data partition (a passphrase-derived
+  master and a HEAD generation, written by loop-mounting the data partition at its GPT offset and
+  running `horizon lifestream init`/`snapshot`). Booted, the chain runs in full: AAVMF (edk2) runs
+  systemd-boot off `BOOTAA64.EFI`, which loads the kernel and the initramfs with the options line
+  (the `horizon.*` tokens plus `horizon.verity=<roothash>`); `horizon-init` loads the boot-path
+  modules, resolves the base off the GPT, opens dm-verity over the base partition against the hash
+  device (`veritysetup`, found by the new PATH, the kernel verifying every block against the root
+  hash with the built-in CONFIG_CRYPTO_SHA256), mounts the verified `/dev/mapper/horizon-base`
+  squashfs as the overlay lower, mounts the ext4 data partition (`crc32c_generic` loaded for ext4's
+  runtime crypto request, since a minimal initramfs has no modprobe to autoload it), discovers and
+  carries the identity store, assembles the OverlayFS, and `switch_root`s into `horizon boot`;
+  `horizon boot` then unlocks the store with the passphrase (read off the serial console) and
+  decrypts HEAD (`boot: unlocked ... with the passphrase`, `boot: 4 object(s)`, `head 5cbee14...`),
+  the same key proven to open the identity. So a tampered base would fail to boot (dm-verity) and the
+  device comes up on its own identity, both on real kernel opens, the eye-verify the container's
+  missing CONFIG_DM_VERITY could never give. The dm-crypt Home open is already proven on a real
+  kernel open in the container's encrypted keystone test (CONFIG_DM_CRYPT=y), so this Ghost+verity
+  boot adds exactly the part QEMU uniquely can: dm-verity and the end-to-end pivot into an unlocked
+  identity. What remains of step (5) is the desktop: `horizon boot` here asks to be rebuilt with
+  `--features compositor-udev` for the bare-metal DRM backend, which needs a virtio-gpu DRM device
+  with working GLES (virgl or a real GPU); plain QEMU TCG offers only a dumb-buffer KMS device with
+  no 3D, so the on-screen session is the last eye-verify and waits for a GPU-backed virtio-gpu (or a
+  software-DRM/pixman scanout backend). Eye-verified in qemu-system-aarch64.
 
 ## Next
 

@@ -1611,6 +1611,36 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   is not handed across the pivot yet), so the console passphrase is fed twice. Left: hand the
   recovered master from init to `horizon boot` so the session does not re-prompt (a refinement),
   and a touch (FIDO2) at the initramfs instead of a typed passphrase.
+- Phase 3 / Phase 0 step (5) softdrm backend hardening (`compositor` `softdrm` feature, Linux):
+  the software-scanout backend, first written single-device/single-output/no-hotplug with input
+  added once at startup, is now multi-device, multi-output, and hotplug-aware and recovers across
+  a VT switch, the same hardening the GLES `udev` backend got, over the same seat routing and
+  compositing the two already share. A `UdevBackend` enumerates and watches the KMS devices; each
+  scans its connectors and lights every connected display on a free CRTC, and a device or monitor
+  plugged in or out is added or dropped (the same connector-diff model as `drm.rs`). Every lit
+  output is placed in one shared logical space (left to right via `compositor::layout`) and scans
+  out only its own region (`output_render_elements`), with the cursor spanning all screens, and is
+  advertised to clients as its own `wl_output` global at its position, mode, and scale (the
+  placeholder retired while any real monitor exists). A VT switch away pauses every device; coming
+  back re-acquires DRM master (`drm.activate`), `reset_state`s and `reset_buffers` each surface,
+  and redraws. Input is no longer one-shot: the path backend is rescanned on a 1s timer, so a
+  keyboard or mouse plugged in after boot is added (and one unplugged removed). The one real
+  divergence from the GLES backend is forced by the types: `DumbAllocator` is not `Clone`, so this
+  cannot use `DrmOutputManager` (which clones the allocator per output); each output instead gets
+  its own `DrmCompositor` over a fresh dumb allocator on the shared device fd, with the raw
+  `DrmDevice` kept per device for surface creation, rescans, and pause/resume. There is no
+  multi-GPU manager either: one pixman renderer composites every output on every device straight
+  into its dumb buffer (CPU memory binds anywhere), so the cross-GPU copy the GLES path needs does
+  not arise. The backend-facing `Compositor` accessors the two DRM backends share (`map_output`,
+  `unmap_output`, `display_handle`, `set_placeholder_global`, and the `wl_output` global helpers)
+  moved from the `udev` feature gate to the shared `drm-backend` marker so softdrm uses them too.
+  Same split as the rest of the backend: compile-checked and clippy-clean under `softdrm` (and
+  `udev`) in CI with the headless compositing/seat tests still green, the multi-output, hotplug,
+  VT, and multi-device paths eye-verified on hardware later; the single-output path is eye-verified
+  in QEMU (the Home desktop boots, three input devices are added, the one connector is lit, the
+  readiness line `software scanout up, 1 output(s) on 1 device(s)` prints, and a clicked `sever`
+  takes on the writable store), proving the new per-output render path and relayout did not
+  regress the working desktop.
 
 ## Next
 

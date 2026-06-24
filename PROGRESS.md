@@ -1582,6 +1582,35 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   token. The mechanism is covered by the existing cmdline round-trip test (it already iterates every
   mode through `init`'s parser); verified through the binary (`--mode ghost` emits `horizon.mode=ghost`,
   the default still `auto`). Built and tested on darwin and in the Linux container.
+- Phase 0 step (5) the writable Home boot and one-command store provisioning (`keybuild` +
+  eye-verify): a Key now boots Home with a read-write identity store, so a clicked or typed
+  `sever` on the Glass desktop actually takes, the last open piece of the on-screen step. The
+  honest blocker was a key mismatch: keybuild built `home.img` before the store existed and
+  keyed it with a throwaway 32-byte keyfile, so a Home boot (which recovers the master from the
+  store and opens `home.img` with it) could never open the layer; the eye-verify fell back to a
+  Ghost boot, where the store is read-only, so a sever failed with `Read-only file system`. The
+  fix binds the two: `keybuild --provision-store <dir>` takes an already-initialized store (one
+  built by `horizon lifestream init`, with its grants seeded by `horizon weave grant`), derives
+  the Home master from that store's own passphrase (`HORIZON_PASSPHRASE`) and salt through
+  `boot`'s canonical Argon2id, keys `home.img` with it, AND bakes the store onto the data
+  partition at build time (`KeySpec::data_seed` -> `mkfs.ext4 -d`, no loop mount), so a Home boot
+  recovers exactly the master the layer was keyed with and mounts the store read-write.
+  `--data-seed <dir>` is the low-level form that just bakes a directory in. `boot` moved from a
+  dev-dependency to a real one (the one canonical derivation lives there). On the usual split, a
+  container keystone test proves the binding (the store-derived master opens the provisioned
+  `home.img`) and writability (a revoke-like commit to the booted store persists across a reopen)
+  on the real squashfs/ext4/LUKS2; and it is eye-verified in QEMU (`--mode home`): the desktop
+  scans out, the boot log confirms the encrypted Home layer opened, a click on the `browser`
+  channel's `sever` button turns it red (`severed`, the header going `4 live`/`0 severed` to
+  `3 live`/`1 severed`) and logs `compositor: severed`, and a typed `browser` still filters the
+  list, all on the writable store. Two boot-recipe gotchas it surfaced, both the `crc32c_generic`
+  class (a minimal initramfs has no modprobe, so the kernel's `request_module` fails): the
+  dm-crypt cipher needs the `xts` and `ecb` crypto template modules in the initramfs (`aes` is
+  built in) or the LUKS open dies with `crypt: Error allocating crypto tfm (-ENOENT)`; and a Home
+  boot unlocks twice (init opens `home.img`, then `horizon boot` opens the store, since the master
+  is not handed across the pivot yet), so the console passphrase is fed twice. Left: hand the
+  recovered master from init to `horizon boot` so the session does not re-prompt (a refinement),
+  and a touch (FIDO2) at the initramfs instead of a typed passphrase.
 
 ## Next
 

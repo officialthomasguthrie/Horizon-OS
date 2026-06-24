@@ -151,6 +151,13 @@ pub struct KeySpec {
     pub datafs: String,
     /// The size of the data partition image, in mebibytes.
     pub data_size_mb: u64,
+    /// A host directory whose contents are written into the data partition's ext4 at
+    /// build time (via `mkfs.ext4 -d`, so no loop mount is needed). This is how the
+    /// identity store is baked onto the Key at build time instead of being loop-mounted
+    /// in afterward; the directory's contents land at the partition root, where
+    /// `boot::discover` finds the store. `None` lays an empty data partition (the
+    /// default), the init then fills its overlay work dirs at boot.
+    pub data_seed: Option<PathBuf>,
     /// The size of the encrypted Home writable layer image, in mebibytes. Larger than
     /// the data partition because it holds the bulk OS state; the LUKS2 header takes a
     /// fixed ~16 MiB off the top, so a tiny value leaves little usable space.
@@ -241,6 +248,7 @@ impl KeySpec {
             basefs: "squashfs".to_string(),
             datafs: "ext4".to_string(),
             data_size_mb: 64,
+            data_seed: None,
             home_size_mb: 256,
             esp_size_mb: 128,
             mode: ModeChoice::Auto,
@@ -410,7 +418,9 @@ pub fn build_base(spec: &KeySpec) -> Result<PathBuf> {
 /// Build the persistent data partition: a labeled ext4 image at `<out>/data.img`, sized
 /// per the spec. This is the writable side of the Key: the init lays the overlay upper
 /// and work directories and the identity store onto it, so unlike the base it is not
-/// reproducible, it is mutable state. Shells out to `mkfs.ext4`. Returns the image path.
+/// reproducible, it is mutable state. When [`KeySpec::data_seed`] is set its contents are
+/// written into the filesystem at creation time (the baked-in identity store), otherwise
+/// the partition starts empty. Shells out to `mkfs.ext4`. Returns the image path.
 pub fn build_data(spec: &KeySpec) -> Result<PathBuf> {
     std::fs::create_dir_all(&spec.out)?;
     let out = spec.out.join(DATA_IMAGE);
@@ -423,8 +433,20 @@ pub fn build_data(spec: &KeySpec) -> Result<PathBuf> {
     let mut cmd = Command::new("mkfs.ext4");
     cmd.args(["-F", "-q", "-L"])
         .arg(&spec.data_label)
-        .arg(&out)
         .stdout(std::process::Stdio::null());
+    // -d copies a directory tree into the new filesystem with no mount and no root, the
+    // way the store is baked in. mke2fs needs the tree to exist; an absent seed is a build
+    // error rather than a silently empty partition.
+    if let Some(seed) = &spec.data_seed {
+        if !seed.is_dir() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("data seed {} is not a directory", seed.display()),
+            )));
+        }
+        cmd.arg("-d").arg(seed);
+    }
+    cmd.arg(&out);
     run(cmd, "mkfs.ext4")?;
     Ok(out)
 }
@@ -474,6 +496,18 @@ pub fn build_home(spec: &KeySpec, master: &[u8; luks::MASTER_KEY_SIZE]) -> Resul
     luks::close(&mapper)?;
     mkfs?;
     Ok(out)
+}
+
+/// Derive the identity master a provisioned Key's Home layer is keyed by, from the store
+/// passphrase and the store's own salt. This is the binding that makes a writable Home boot
+/// work: the master `boot` recovers from the store at boot (passphrase plus the store's
+/// `keysalt`) must equal the one `home.img` was keyed with, or the LUKS open fails and the
+/// boot falls back to Ghost. Deriving both here through [`boot::passphrase_master`], the one
+/// canonical Argon2id derivation, is what guarantees they match. `store` is an
+/// already-initialized store directory (built by `horizon lifestream init`); its contents
+/// are then baked onto the data partition via [`KeySpec::data_seed`].
+pub fn provision_master(store: &Path, passphrase: &str) -> Result<[u8; luks::MASTER_KEY_SIZE]> {
+    boot::passphrase_master(store, passphrase).map_err(|e| Error::Provision(e.to_string()))
 }
 
 /// What a verity build produced: the hash device image and the root hash that anchors it.
@@ -2390,6 +2424,167 @@ mod linux_tests {
         assert_eq!(booted.master, master);
         assert_eq!(booted.method, Method::Keyslot);
         assert!(booted.head.is_some());
+
+        cleanup();
+    }
+
+    // The provisioning keystone: a Key built the --provision-store way boots Home with a
+    // WRITABLE store, which is what makes a clicked or typed sever actually take. The earlier
+    // encrypted keystone keyed the Home layer from a master it derived itself and loop-mounted
+    // the store in afterward; here the store is built first (as `horizon lifestream init`
+    // does), baked onto the data partition at build time (build_data's data_seed, no loop
+    // mount), and the Home layer is keyed by provision_master, the master derived from that
+    // store's own passphrase and salt. The proof is the binding plus writability: the master a
+    // Home boot recovers from the baked store (boot::unlock, the passphrase path) equals the
+    // one home.img was keyed with, so init::luks_open succeeds; the seeded data partition is
+    // discoverable as the store at its root; and a commit to that store on the read-write Home
+    // mount persists across a reopen (a weave revoke is one such append, so this is the sever
+    // taking). Skips where a build tool, loop device, or device-mapper is unavailable; tears
+    // every mount, loop, and mapping down on each path.
+    #[test]
+    fn a_provisioned_key_boots_home_with_a_writable_store() {
+        use boot::{derive, discover, unlock, Method};
+        use init::{luks_close, luks_open, HOME_MAPPER};
+        use lifestream::{Lifestream, ObjectId};
+
+        const PASS: &str = "correct horse battery staple";
+        const SALT: &[u8] = b"horizon-provision-keystone-salt!";
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = KeySpec::new(dir.path());
+        spec.home_size_mb = 48;
+        let master = derive(PASS, SALT);
+
+        // Build the identity store first, exactly as `horizon lifestream init` does: a store
+        // keyed by the passphrase-derived master, the keysalt written beside it, a seed
+        // snapshotted, a HEAD committed.
+        let store = dir.path().join("provision-store");
+        let ls = Lifestream::init(&store, &master).unwrap();
+        std::fs::write(store.join("keysalt"), SALT).unwrap();
+        let seed = dir.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::write(seed.join("hello"), b"horizon").unwrap();
+        let tree = ls.snapshot_dir(&seed).unwrap();
+        let g0 = ls.commit(tree, vec![], "first").unwrap();
+        drop(ls);
+
+        // The provisioning binding: the Home master derived from the store (what
+        // --provision-store does) equals the one the store was inited with, so home.img and
+        // the store share one key.
+        assert_eq!(provision_master(&store, PASS).unwrap(), master);
+
+        // Bake the store onto the data partition (no loop mount) and key the Home layer with
+        // the provisioned master, the --disk --provision-store path.
+        spec.data_seed = Some(store.clone());
+        let Some(base) = build_or_skip(dir.path()) else {
+            return;
+        };
+        let data = match build_data(&spec) {
+            Ok(p) => p,
+            Err(Error::Missing(_)) => {
+                eprintln!("skipping: mkfs.ext4 not installed");
+                return;
+            }
+            Err(e) => panic!("build data (seeded): {e}"),
+        };
+        let home = match build_home(&spec, &provision_master(&store, PASS).unwrap()) {
+            Ok(p) => p,
+            Err(Error::Missing(t)) => {
+                eprintln!("skipping: {t} not installed");
+                return;
+            }
+            Err(e) if is_dm_unavailable(&e) => {
+                eprintln!("skipping: device-mapper not permitted here ({e})");
+                return;
+            }
+            Err(e) => panic!("build home (provisioned): {e}"),
+        };
+
+        // Mount the data partition read-write, as a Home boot does (the store accumulates
+        // generations). The base is unused here; this test is about the store and the key.
+        let _ = &base;
+        let Some(data_loop) = losetup(&data, false) else {
+            eprintln!("skipping: losetup not permitted here");
+            return;
+        };
+        let data_mnt = dir.path().join("data-mnt");
+        std::fs::create_dir_all(&data_mnt).unwrap();
+        let cleanup = || {
+            let _ = luks_close(HOME_MAPPER);
+            umount(&data_mnt);
+            losetup_d(&data_loop);
+        };
+        if let Err(e) = execute(&Plan {
+            steps: vec![Step::Mount {
+                source: Source::new(data_loop.as_str(), "ext4", MountFlags::default()),
+                target: data_mnt.clone(),
+            }],
+        }) {
+            cleanup();
+            if is_unprivileged_error(&e) {
+                eprintln!("skipping: mounting not permitted here ({e})");
+                return;
+            }
+            panic!("mount seeded data partition: {e}");
+        }
+
+        // The baked store is discoverable at the partition root (the seed landed), the way the
+        // init finds it before recovering the master.
+        let discovered = match discover(&data_mnt) {
+            Ok(s) => s,
+            Err(e) => {
+                cleanup();
+                panic!("the baked store must be discoverable on the data partition: {e}");
+            }
+        };
+        assert_eq!(discovered, data_mnt, "the seeded store sits at the partition root");
+
+        // Recover the master from the baked store the way the init does with no token (the
+        // passphrase path), and open the encrypted Home layer with it: a successful open is the
+        // binding (a wrong key fails here), so the provisioned home.img is unlocked by the same
+        // master the store yields.
+        let (recovered, method) = match unlock(&discovered, None, || Ok(PASS.to_string())) {
+            Ok(r) => r,
+            Err(e) => {
+                cleanup();
+                panic!("recover the master from the baked store: {e}");
+            }
+        };
+        assert_eq!(method, Method::Passphrase);
+        assert_eq!(recovered, master);
+        match luks_open(&home, HOME_MAPPER, &recovered) {
+            Ok(_) => {}
+            Err(e) => {
+                cleanup();
+                panic!("the store-derived master must open the provisioned Home layer: {e}");
+            }
+        }
+        let _ = luks_close(HOME_MAPPER);
+
+        // The store on the read-write Home mount accepts a write that persists across a reopen:
+        // a second generation committed to the baked store advances HEAD, which is exactly the
+        // append a weave revoke makes, so a sever takes on this boot (a Ghost read-only mount
+        // would refuse it).
+        let writable = (|| -> std::result::Result<(ObjectId, ObjectId), String> {
+            let ls = Lifestream::open(&discovered, &recovered).map_err(|e| e.to_string())?;
+            let parents = ls.head().map_err(|e| e.to_string())?.into_iter().collect();
+            let tree = ls.snapshot_dir(&seed).map_err(|e| e.to_string())?;
+            let g1 = ls.commit(tree, parents, "second").map_err(|e| e.to_string())?;
+            drop(ls);
+            // Reopen to prove the write reached the partition, not just an in-memory store.
+            let reopened = Lifestream::open(&discovered, &recovered).map_err(|e| e.to_string())?;
+            let head = reopened.head().map_err(|e| e.to_string())?.ok_or("no HEAD")?;
+            Ok((g1, head))
+        })();
+        let (g1, head) = match writable {
+            Ok(v) => v,
+            Err(e) => {
+                cleanup();
+                panic!("the booted Home store must be writable: {e}");
+            }
+        };
+        assert_ne!(g1, g0, "the revoke-like commit is a new generation");
+        assert_eq!(head, g1, "the write persisted to the data partition");
 
         cleanup();
     }

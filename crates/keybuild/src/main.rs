@@ -21,7 +21,14 @@
 // (with --loader-timeout setting the menu wait); with neither it lays the /EFI/BOOT skeleton. --disk
 // assembles the ESP, base, the verity hash device (when --verity), data, and Home partitions
 // into one bootable GPT disk (key.img), building the ESP, data, and Home partitions too, so it
-// needs --home-keyfile. --initramfs builds the initramfs (initramfs.img, a gzip newc cpio) with
+// needs the Home master (--home-keyfile, or derived by --provision-store).
+// --provision-store <dir> bakes an existing identity store (one built by `horizon lifestream
+// init`) onto the data partition and keys the Home layer with the master derived from that
+// store's passphrase (HORIZON_PASSPHRASE) and its own salt, so a Home boot opens the encrypted
+// writable layer with the same master it recovers from the store: that is what makes the booted
+// store writable and a clicked or typed sever actually take. --data-seed <dir> is the low-level
+// form: it bakes a directory into the data partition without touching the Home key.
+// --initramfs builds the initramfs (initramfs.img, a gzip newc cpio) with
 // /init from --init-bin (horizon-init), each --initramfs-bin (cryptsetup) under /usr/sbin, and
 // each --initramfs-module under /lib/modules/<kver>, all with their shared-library / modules.dep
 // closures; it is built before the ESP so a bootable ESP can write it in.
@@ -45,6 +52,8 @@ struct Args {
     verity: bool,
     home: bool,
     home_keyfile: Option<PathBuf>,
+    data_seed: Option<PathBuf>,
+    provision_store: Option<PathBuf>,
     esp: bool,
     disk: bool,
     initramfs: bool,
@@ -67,7 +76,8 @@ fn main() -> ExitCode {
              [--kver <version> --module <name>...] [--modules-root <dir>] \
              [--firmware <path>]... [--firmware-root <dir>] \
              [--stage <src[:dst]>]... [--verity] \
-             [--home --home-keyfile <32-byte-master>] [--esp] [--disk] \
+             [--home --home-keyfile <32-byte-master>] \
+             [--provision-store <store-dir>] [--data-seed <dir>] [--esp] [--disk] \
              [--initramfs --init-bin <path> [--initramfs-bin <path>]... \
              [--initramfs-module <name>]...] \
              [--kernel <path> --bootloader <path> [--esp-efi <path>]... \
@@ -110,6 +120,40 @@ fn main() -> ExitCode {
     let home = parsed.home || disk;
     let esp = parsed.esp || disk;
     let home_keyfile = parsed.home_keyfile;
+
+    // Provisioning: bake an existing identity store onto the data partition and key the Home
+    // layer with the master derived from that store's passphrase, so a Home boot opens the
+    // layer with the same master it recovers from the store (the writable-store binding that
+    // makes a clicked or typed sever take). --data-seed alone just bakes a directory in
+    // without touching the Home key. The store is baked only by --disk (the data partition is
+    // built there), so provisioning is meant to ride along with --disk.
+    if let Some(store) = parsed.provision_store.as_ref() {
+        spec.data_seed = Some(store.clone());
+    } else if let Some(seed) = parsed.data_seed.as_ref() {
+        spec.data_seed = Some(seed.clone());
+    }
+    if parsed.provision_store.is_some() && !disk {
+        eprintln!("horizon-keybuild: note: --provision-store bakes the store only with --disk");
+    }
+
+    // The Home layer's master, resolved before any image is built so a bad passphrase or a
+    // missing keyfile fails fast: derived from the store passphrase when provisioning, else
+    // read from --home-keyfile. Only needed when a Home layer is built.
+    let home_master = if home {
+        let m = match parsed.provision_store.as_ref() {
+            Some(store) => provision_master(store),
+            None => read_master(home_keyfile.as_deref()),
+        };
+        match m {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("horizon-keybuild: home: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
 
     match keybuild::build_base(&spec) {
         Ok(path) => {
@@ -154,16 +198,11 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            // The encrypted Home writable layer, keyed by the 32-byte master in the
-            // keyfile so boot's recovered master unlocks it.
+            // The encrypted Home writable layer, keyed by the 32-byte master (derived from
+            // the store passphrase when provisioning, else read from the keyfile) so boot's
+            // recovered master unlocks it.
             if home {
-                let master = match read_master(home_keyfile.as_deref()) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("horizon-keybuild: home: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
+                let master = home_master.expect("home implies a resolved master");
                 match keybuild::build_home(&spec, &master) {
                     Ok(p) => println!(
                         "home: built {} ({} MiB LUKS2, ext4 inside, label {})",
@@ -265,6 +304,8 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut verity = false;
     let mut home = false;
     let mut home_keyfile = None;
+    let mut data_seed = None;
+    let mut provision_store = None;
     let mut esp = false;
     let mut disk = false;
     let mut initramfs = false;
@@ -291,6 +332,8 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--verity" => verity = true,
             "--home" => home = true,
             "--home-keyfile" => home_keyfile = Some(PathBuf::from(it.next()?)),
+            "--data-seed" => data_seed = Some(PathBuf::from(it.next()?)),
+            "--provision-store" => provision_store = Some(PathBuf::from(it.next()?)),
             "--esp" => esp = true,
             "--disk" => disk = true,
             "--initramfs" => initramfs = true,
@@ -325,6 +368,8 @@ fn parse_args(args: &[String]) -> Option<Args> {
         verity,
         home,
         home_keyfile,
+        data_seed,
+        provision_store,
         esp,
         disk,
         initramfs,
@@ -357,6 +402,18 @@ fn parse_stage(arg: &str) -> Option<keybuild::Stage> {
         src: PathBuf::from(src),
         dst: PathBuf::from(dst),
     })
+}
+
+// Derive the 32-byte Home master from an existing store's passphrase and its own salt, the
+// --provision-store path. The passphrase comes from HORIZON_PASSPHRASE (the variable every
+// horizon tool reads), so a build script and the QEMU harness need no interactive prompt;
+// the derivation itself is the canonical one boot uses, so the key home.img gets here equals
+// the one a Home boot recovers from the store.
+fn provision_master(store: &std::path::Path) -> Result<[u8; 32], String> {
+    let pass = std::env::var("HORIZON_PASSPHRASE").map_err(|_| {
+        "set HORIZON_PASSPHRASE to the store passphrase for --provision-store".to_string()
+    })?;
+    keybuild::provision_master(store, &pass).map_err(|e| e.to_string())
 }
 
 // Read the 32-byte identity master from the keyfile --home is keyed by. Exactly 32 bytes:

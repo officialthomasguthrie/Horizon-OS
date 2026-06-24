@@ -58,6 +58,10 @@ pub enum Error {
     /// `build_initramfs` was called without naming the `/init` binary to install as PID 1.
     #[error("an init binary is required to build the initramfs")]
     NoInitBin,
+    /// Provisioning could not derive the Home master from the store passphrase and salt
+    /// (the path given is not a store, or its `keysalt` is unreadable).
+    #[error("provision: {0}")]
+    Provision(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

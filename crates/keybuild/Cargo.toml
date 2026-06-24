@@ -21,6 +21,10 @@ path = "src/main.rs"
 # The build emits what init consumes (the labels, the boot command line), so it shares
 # init's types: the build/boot contract lives in one place.
 init = { path = "../init" }
+# Provisioning derives the Home layer's master from the store passphrase and the store's
+# own salt, the same canonical Argon2id derivation boot recovers it by at boot, so the key
+# home.img is built with always matches the one a Home boot unlocks it with.
+boot = { path = "../boot" }
 thiserror.workspace = true
 # dm-verity over the base is a SHA-256 Merkle hash tree (the format veritysetup writes),
 # so the hash primitive is SHA-256, not the BLAKE3 the Lifestream addresses with.
@@ -30,6 +34,5 @@ sha2.workspace = true
 tempfile.workspace = true
 # The keystone integration test builds a Key, assembles it through the init, and proves
 # horizon boot opens the identity on it, so it reaches across the whole boot path.
-boot = { path = "../boot" }
 lifestream = { path = "../lifestream" }
 identity = { path = "../identity" }

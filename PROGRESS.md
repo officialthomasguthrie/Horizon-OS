@@ -1665,6 +1665,36 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   `sever` takes on the writable store. Left of step (5): a FIDO2 touch at the initramfs (the
   identity `HardwareKey` is built but not wired into the init), and the x86-64 cross-compiled
   product (this container is aarch64/TCG).
+- Phase 0 step (5) key/token recovery at the initramfs, not only a passphrase (`init` + `keybuild`):
+  `horizon-init` recovered the identity master only from the typed passphrase (it passed `None` for
+  the authenticator), so the touch-to-boot path the `boot` crate already implements (try an enrolled
+  keyslot through a present `Authenticator`, fall back to the passphrase) was unreachable at boot.
+  The init now builds an authenticator from the kernel command line and hands it to `boot::unlock`:
+  `horizon.fido2` opens a FIDO2 security key (a touch, behind init's new `fido2` feature, which links
+  identity's USB-HID backend) and `horizon.token=<path>` reads a software token, each tried as a
+  keyslot before the passphrase. The recovered master still rides the existing memfd handoff across
+  switch_root, so a key/token Home boot reaches the desktop with nothing typed. The selection is a
+  testable `init::authenticator` over `Params`; a failed touch, a stranger token, or no enrolled slot
+  falls through to the passphrase, while a named-but-unreadable token is a surfaced error, not a
+  silent fallback. `keybuild` gained `--initramfs-file <src[:dst]>` to stage a plain data file into
+  the initramfs (RAM the kernel unpacks and the switch_root discards), so a software token seed
+  recovers the master and never lands on the Key's disk. On the usual headless split, the testable
+  core is proven with no device: init units that `parse_cmdline` reads `horizon.fido2`/`horizon.token`
+  and that the token selector opens an enrolled keyslot back to its master (yielding none with no
+  device, erroring on a short token), a keybuild unit that a staged token unpacks at its destination
+  with bytes intact, and clippy-clean builds with and without the `fido2` feature. Eye-verified in
+  QEMU with the software token: a Key provisioned with an enrolled token keyslot, the seed staged
+  into the initramfs and `horizon.token=/horizon-token` on the cmdline, boots Home with NO passphrase
+  on the console (stdin `/dev/null`, so any passphrase fallback would derive a wrong master and fail
+  to scan out) and the log shows `unlocked the Home layer via security key / token`, then the handoff,
+  scanout, and a clicked `sever` taking on the writable store (header `4 live / 0 severed` ->
+  `3 live / 1 severed`). The real FIDO2 path is the same `boot::unlock` call with `HardwareKey`
+  swapped in for the software token (compile-checked under the `fido2` feature); the literal
+  libfido2/hidraw touch is eye-verify-gated to real hardware, because this aarch64/TCG container has
+  no virtual CTAP2-hmac-secret token: QEMU 7.2 here ships only `u2f-passthru` (needs a real host key),
+  not `canokey` or `u2f-emulated`, and U2F/CTAP1 emulation could not carry the keyslot's hmac-secret
+  extension anyway. Left of step (5): the real FIDO2 touch on hardware, and the x86-64 cross-compiled
+  product.
 
 ## Next
 

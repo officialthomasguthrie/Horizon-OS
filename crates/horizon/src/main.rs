@@ -66,6 +66,11 @@ enum Cmd {
         #[command(subcommand)]
         op: CellOp,
     },
+    /// Aura, the intent layer: turn a typed intent into capability-checked tool calls
+    Aura {
+        #[command(subcommand)]
+        op: AuraOp,
+    },
     /// Run the Wayland compositor (the experience layer)
     Compositor {
         #[command(subcommand)]
@@ -367,6 +372,23 @@ enum WeaveOp {
 }
 
 #[derive(Subcommand)]
+enum AuraOp {
+    /// List the tools Aura may call, with their effect and the capabilities they need
+    Tools,
+    /// Plan an intent and preview it: the tool calls and the capabilities each needs,
+    /// without running anything
+    Plan {
+        /// The intent, e.g. "find cows in /home/me/docs"
+        intent: Vec<String>,
+    },
+    /// Run a scripted end-to-end story: an intent becomes a plan, the missing
+    /// capabilities are surfaced (never silently acquired), you approve, it runs
+    /// through the broker (every access audited), and a destructive step waits for
+    /// confirmation, while a reach for something ungranted is refused
+    Demo,
+}
+
+#[derive(Subcommand)]
 enum GlassOp {
     /// Render the live transparency view: per-principal channels and a timeline
     Show {
@@ -414,6 +436,7 @@ fn main() -> Result<()> {
         Cmd::Identity { op } => identity_cmd(op),
         Cmd::Constellation { op } => constellation_cmd(op),
         Cmd::Cell { op } => cell_cmd(op),
+        Cmd::Aura { op } => aura_cmd(op),
         Cmd::Compositor { op } => compositor_cmd(op),
         Cmd::Boot {
             store,
@@ -693,6 +716,186 @@ fn weave_demo(store: &Path) -> Result<()> {
     println!();
     println!("verify:  {} entries, chain intact", b.verify()?);
     Ok(())
+}
+
+fn aura_cmd(op: AuraOp) -> Result<()> {
+    match op {
+        AuraOp::Tools => {
+            print!("{}", aura::Catalog::standard().describe());
+            Ok(())
+        }
+        AuraOp::Plan { intent } => aura_plan(&intent.join(" ")),
+        AuraOp::Demo => aura_demo(),
+    }
+}
+
+// A throwaway store and broker under the temp dir, for the self-contained Aura
+// commands that need no existing identity. The caller removes the directory.
+fn throwaway_broker(tag: &str) -> Result<(PathBuf, Broker)> {
+    let dir = std::env::temp_dir().join(format!("horizon-aura-{tag}.{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let ls = Lifestream::init(dir.join("store"), &[0xA1u8; 32])?;
+    let broker = Broker::open(ls, weave::Policy::DenyAll)?;
+    Ok((dir, broker))
+}
+
+fn aura_plan(intent: &str) -> Result<()> {
+    let (dir, mut broker) = throwaway_broker("plan")?;
+    let aura = aura::Aura::new(&mut broker);
+    let result = (|| -> Result<()> {
+        let plan = aura
+            .plan(&aura::RulePlanner, intent)
+            .map_err(|e| anyhow!("{e}"))?;
+        let preview = aura.preview(&plan);
+        println!("intent:  {}", plan.intent);
+        println!();
+        print_aura_preview(&preview);
+        println!();
+        if preview.ready() {
+            println!("ready: every capability is held");
+        } else {
+            println!(
+                "would need {} capability grant(s) before this can run:",
+                preview.missing().len()
+            );
+            for need in preview.missing() {
+                println!("  grant aura  {}  {}", need.resource, need.rights);
+            }
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+// The scripted Aura story, the sibling of `weave demo` and `cell demo`. It makes
+// the docs/05 design concrete at the command line: Aura is a principal in the
+// Weave, it acts only through capabilities you granted, missing ones are
+// surfaced rather than acquired, destructive steps wait for confirmation, audit
+// records every access, and a reach for something ungranted is simply refused.
+fn aura_demo() -> Result<()> {
+    let (dir, mut broker) = throwaway_broker("demo")?;
+    let result = aura_demo_inner(&dir, &mut broker);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn aura_demo_inner(dir: &Path, broker: &mut Broker) -> Result<()> {
+    // A little world for the file tools to act on.
+    let work = dir.join("work");
+    std::fs::create_dir_all(work.join("downloads"))?;
+    std::fs::write(
+        work.join("cattle.md"),
+        "grazing rotations from spring: when to move the cows between paddocks\n",
+    )?;
+    std::fs::write(work.join("notes.txt"), "unrelated\n")?;
+    std::fs::write(work.join("downloads").join("installer.tmp"), "junk\n")?;
+    let work = work.canonicalize()?;
+
+    let planner = aura::RulePlanner;
+    let mut aura = aura::Aura::new(broker);
+    println!(
+        "# Aura is the principal \"{}\" in the Weave",
+        aura.principal()
+    );
+    println!("# it can do only what you grant; everything it touches is audited\n");
+
+    // 1. A read intent. Preview surfaces the missing capability; you approve it;
+    //    then it runs and the access is logged.
+    let intent = format!("find cows in {}", work.display());
+    let plan = aura.plan(&planner, &intent).map_err(|e| anyhow!("{e}"))?;
+    let pv = aura.preview(&plan);
+    println!("intent:  {intent}");
+    print_aura_preview(&pv);
+    println!("you approve the {} missing capability:", pv.missing().len());
+    aura.grant_missing(&pv, Limits::none())
+        .map_err(|e| anyhow!("{e}"))?;
+    let report = aura.execute(&plan, false);
+    print_aura_report(&report);
+    println!();
+
+    // 2. A second intent the same directory grant already covers: no new
+    //    authority needed (least privilege, reused).
+    let intent = format!("read {}", work.join("cattle.md").display());
+    let plan = aura.plan(&planner, &intent).map_err(|e| anyhow!("{e}"))?;
+    let pv = aura.preview(&plan);
+    println!("intent:  {intent}");
+    println!(
+        "  (already covered by the directory grant: {} missing)",
+        pv.missing().len()
+    );
+    let report = aura.execute(&plan, false);
+    print_aura_report(&report);
+    println!();
+
+    // 3. A destructive intent. It waits for confirmation even once authorized.
+    let victim = work.join("downloads").join("installer.tmp");
+    let intent = format!("delete {}", victim.display());
+    let plan = aura.plan(&planner, &intent).map_err(|e| anyhow!("{e}"))?;
+    let pv = aura.preview(&plan);
+    println!("intent:  {intent}");
+    print_aura_preview(&pv);
+    aura.grant_missing(&pv, Limits::none())
+        .map_err(|e| anyhow!("{e}"))?;
+    println!("run without confirming:");
+    print_aura_report(&aura.execute(&plan, false));
+    println!("you confirm the destructive step:");
+    print_aura_report(&aura.execute(&plan, true));
+    println!();
+
+    // 4. The least-privilege punchline: a reach for something never granted is
+    //    refused, no matter what the model was asked to do (docs/05 prompt
+    //    injection stance: the capability model bounds the damage).
+    let intent = "read /etc/shadow".to_string();
+    let plan = aura.plan(&planner, &intent).map_err(|e| anyhow!("{e}"))?;
+    println!("intent:  {intent}");
+    print_aura_report(&aura.execute(&plan, true));
+    println!();
+
+    println!("# audit log (the Glass stand-in)");
+    print_audit(aura.broker())?;
+    Ok(())
+}
+
+fn print_aura_preview(pv: &aura::Preview) {
+    for s in &pv.steps {
+        let eff = s.effect.map(|e| e.label()).unwrap_or("?");
+        println!(
+            "  step {}: {} ({})  -- {}",
+            s.index + 1,
+            s.tool,
+            eff,
+            s.rationale
+        );
+        for n in &s.needs {
+            let mark = if n.is_held() { "held" } else { "MISSING" };
+            println!("      needs {} {}  [{mark}]", n.resource, n.rights);
+        }
+        if let Some(b) = &s.block {
+            println!("      -> {}", b.reason());
+        }
+    }
+}
+
+fn print_aura_report(r: &aura::Report) {
+    for res in &r.results {
+        match &res.status {
+            aura::StepStatus::Done(o) => {
+                println!("  step {}: {} -> {}", res.index + 1, res.tool, o.summary())
+            }
+            aura::StepStatus::Blocked(b) => {
+                println!(
+                    "  step {}: {} BLOCKED ({})",
+                    res.index + 1,
+                    res.tool,
+                    b.reason()
+                )
+            }
+            aura::StepStatus::Failed(e) => {
+                println!("  step {}: {} FAILED ({e})", res.index + 1, res.tool)
+            }
+        }
+    }
 }
 
 fn cell_cmd(op: CellOp) -> Result<()> {

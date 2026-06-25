@@ -1,0 +1,17 @@
+[package]
+name = "aura"
+description = "Aura: Horizon's on-device intent layer, a principal in the Weave"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+weave = { path = "../weave" }
+thiserror.workspace = true
+
+[dev-dependencies]
+lifestream = { path = "../lifestream" }
+tempfile.workspace = true

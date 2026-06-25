@@ -41,6 +41,7 @@ identity-fido2 = ["identity/fido2"]
 lifestream = { path = "../lifestream" }
 boot = { path = "../boot" }
 weave = { path = "../weave" }
+aura = { path = "../aura" }
 glass = { path = "../glass" }
 constellation = { path = "../constellation" }
 reconstitution = { path = "../reconstitution" }

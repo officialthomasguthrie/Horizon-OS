@@ -1731,6 +1731,47 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   aarch64 now produce and boot a real x86-64 Key. Left of step (5): the real FIDO2 touch on
   hardware (the one part with no in-container equivalent). Code: the keybuild cross-ldd change; the
   cross build is environment plus the gitignored `target/x86-build-and-verify.sh` harness.
+- Phase 4 Aura intent layer (`aura` crate + `horizon`): the start of the AI layer, and the
+  part of it that can be proven without a model. docs/05's central decision is that Aura is not
+  bolted onto the OS, it is a principal in the Weave that acts only through capabilities you
+  granted, every action scoped, previewed, audited, and reversible. This builds exactly that
+  spine on the same headless split the rest of the system uses, with the LLM as the
+  weights-and-GPU-gated shim that plugs in later (the analog of the compositor's display
+  backends or identity's `HardwareKey`, eye-verified on hardware next). Three pieces. (1) A tool
+  layer (`tool.rs`): a `Tool` is a typed, permissioned OS action, and each invocation declares
+  the Weave `Need`s (resource + rights) it requires, so the only way Aura touches a file is
+  through a capability the broker checked and logged, the "capabilities, not pixels" rule. The
+  standard `Catalog` is five real file tools (`list_dir`, `read_file`, `find` (lexical now, the
+  stand-in for the semantic index later), `move_file`, `delete_file`), each carrying an `Effect`
+  (Read / Write / Destructive) that drives the safety rails; `move_file` needs two capabilities
+  (read+write at the source, write at the destination) so a move cannot be smuggled past a
+  source-only grant. (2) A planner seam (`plan.rs`): `Planner` turns an intent into a `Plan` of
+  tool calls, and the one method is all the executor depends on, so the real LLM (llama.cpp
+  tool-calling) and the deterministic `RulePlanner` are interchangeable. `RulePlanner` parses a
+  small verb grammar (list/read/find/search/move/delete) into plans with no model weights, the
+  dev and test seam, the analog of identity's `SoftwareAuthenticator`. (3) A safety-railed
+  executor (`Aura` over a `Broker`): a held-capability wallet, `preview` (resolve each step's
+  tool and needs and mark which are held, with no side effects and nothing acquired, so a missing
+  capability is surfaced rather than silently taken, the docs/05 rail), a destructive-confirm
+  gate, and `execute` that brokers every step's capability (weave `access`, which logs a use and
+  enforces scope) before the tool runs and skips, never silently runs, a step whose capability is
+  not held. Held-only authority is safe under any policy (it never requests), so "no silent
+  acquisition" holds regardless of the broker policy. Proven headlessly against a real broker: 10
+  tests (planner parse for every verb and the malformed/unknown cases; a preview marks a missing
+  capability and acquires nothing; an authorized read runs and lands a use in the audit log; a
+  destructive step is blocked until confirmed; a one-file grant does not cover a sibling; a
+  directory grant covers files beneath it). `horizon aura demo` makes the whole docs/05 story
+  visible at the command line, the sibling of `weave demo` and `cell demo`: a find intent surfaces
+  its missing capability and you approve it, a second intent the same directory grant already
+  covers needs no new authority, a destructive delete waits for confirmation, and a reach for
+  `/etc/shadow` Aura was never granted is simply refused, with the grants and uses shown in the
+  audit log (the Glass stand-in); `horizon aura plan "<intent>"` previews a plan and the
+  capabilities it would need, and `horizon aura tools` lists the catalog. Cross-platform (weave is),
+  so built and tested on darwin directly. Next on the AI layer: the llama.cpp `Planner` backend
+  (GGUF, behind a feature, eye-verified on hardware), the semantic index `find` becomes (embeddings
+  + vector search over the Lifestream), and Aura as the Glass desktop's command palette (the
+  `glass::aura` line already parses launch/sever/filter; this is the general intent->capability core
+  it grows into).
 
 ## Next
 

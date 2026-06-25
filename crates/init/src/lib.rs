@@ -453,6 +453,18 @@ pub struct Params {
     /// The dm-verity hash device (the Merkle tree). Consulted only when `verity` is `Some`.
     pub verity_dev: Spec,
     pub mode: ModeChoice,
+    /// Recover the master with a FIDO2 security key (touch-to-boot) when set by
+    /// `horizon.fido2`. Honored only in a build with the `fido2` feature; in a build
+    /// without it the flag is parsed but ignored, so the boot falls back to the
+    /// passphrase. The keyslot path is tried first; a failed or absent touch falls
+    /// back to the passphrase, so a Key with a lost device still opens.
+    pub fido2: bool,
+    /// A software token file to recover the master with, from `horizon.token=<path>`.
+    /// The path is read in the initramfs (a token staged into it, or on a presented
+    /// medium) before the Home layer is opened; absent, the unlock uses the passphrase.
+    /// Like `fido2`, the keyslot it opens is tried first and the passphrase is the
+    /// fallback. This is the device-free stand-in the boot is eye-verified with.
+    pub token: Option<PathBuf>,
     pub init: PathBuf,
     pub init_args: Vec<String>,
 }
@@ -469,6 +481,8 @@ impl Default for Params {
             verity: None,
             verity_dev: Spec::Label(VERITY_LABEL.into()),
             mode: ModeChoice::Auto,
+            fido2: false,
+            token: None,
             init: PathBuf::from(DEFAULT_INIT),
             init_args: vec!["boot".into()],
         }
@@ -478,8 +492,8 @@ impl Default for Params {
 /// Parse the kernel command line into [`Params`]. Recognized tokens, all optional:
 /// `horizon.base=`, `horizon.basefs=`, `horizon.data=`, `horizon.datafs=`,
 /// `horizon.home=`, `horizon.homefs=`, `horizon.verity=<roothash>`, `horizon.veritydev=`,
-/// `horizon.mode=home|ghost|auto`, `horizon.init=`. Anything else (the kernel's own
-/// arguments) is ignored.
+/// `horizon.mode=home|ghost|auto`, `horizon.fido2`, `horizon.token=<path>`,
+/// `horizon.init=`. Anything else (the kernel's own arguments) is ignored.
 pub fn parse_cmdline(cmdline: &str) -> Params {
     let mut p = Params::default();
     for tok in cmdline.split_whitespace() {
@@ -501,11 +515,73 @@ pub fn parse_cmdline(cmdline: &str) -> Params {
             p.verity_dev = Spec::parse(v);
         } else if let Some(v) = tok.strip_prefix("horizon.mode=") {
             p.mode = ModeChoice::parse(v);
+        } else if tok == "horizon.fido2" {
+            p.fido2 = true;
+        } else if let Some(v) = tok.strip_prefix("horizon.token=") {
+            p.token = Some(PathBuf::from(v));
         } else if let Some(v) = tok.strip_prefix("horizon.init=") {
             p.init = PathBuf::from(v);
         }
     }
     p
+}
+
+/// Build the authenticator the initramfs recovers the master through, from the boot
+/// [`Params`]: a FIDO2 security key when `horizon.fido2` is set (in a build with the
+/// `fido2` feature), else a software token read from `horizon.token=<path>`, else
+/// `None` for a passphrase-only boot. The result feeds [`boot::unlock`], which tries
+/// the keyslot the authenticator opens first and falls back to the passphrase, so a
+/// failed touch, a stranger token, or no enrolled slot never strands the boot.
+///
+/// `horizon.fido2` asked for in a build without FIDO2 support resolves to `None` (a
+/// note on the console), so such a Key still opens via the passphrase rather than
+/// failing. A `horizon.token` that cannot be read or is not 32 bytes is an error,
+/// because the operator named a token they expected to use; the passphrase fallback
+/// is for the no-device case, not a misconfigured one.
+#[cfg(target_os = "linux")]
+pub fn authenticator(params: &Params) -> Result<Option<Box<dyn identity::Authenticator>>> {
+    if params.fido2 {
+        #[cfg(feature = "fido2")]
+        {
+            let key = identity::HardwareKey::open(fido2_pin())
+                .map_err(|e| Error::Boot(format!("open security key: {e}")))?;
+            return Ok(Some(Box::new(key)));
+        }
+        #[cfg(not(feature = "fido2"))]
+        eprintln!(
+            "horizon-init: horizon.fido2 set but this init has no FIDO2 support; using the passphrase"
+        );
+    }
+    if let Some(path) = &params.token {
+        return Ok(Some(Box::new(identity::SoftwareAuthenticator::new(
+            read_token(path)?,
+        ))));
+    }
+    Ok(None)
+}
+
+/// Read a 32-byte software token seed from `path`. The token is a secret a holder
+/// presents at boot (staged into the initramfs for an eye-verify, or on a removable
+/// medium); it never has to be exactly the device, only a stand-in that opens an
+/// enrolled keyslot.
+#[cfg(target_os = "linux")]
+fn read_token(path: &Path) -> Result<[u8; 32]> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| Error::Boot(format!("read token {}: {e}", path.display())))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Boot(format!("token {} is not 32 bytes", path.display())))
+}
+
+/// The FIDO2 device PIN from the environment, or `None` for a key that needs no user
+/// verification. The initramfs console is already reading the passphrase fallback, so
+/// the PIN is taken only from `HORIZON_FIDO2_PIN` here, not prompted.
+#[cfg(all(target_os = "linux", feature = "fido2"))]
+fn fido2_pin() -> Option<String> {
+    std::env::var("HORIZON_FIDO2_PIN")
+        .ok()
+        .filter(|p| !p.is_empty())
 }
 
 /// Decide the writable-layer mode from the command-line choice and whether the data
@@ -957,6 +1033,66 @@ mod tests {
         assert_eq!(p.mode, ModeChoice::Auto);
         assert_eq!(p.init, PathBuf::from(DEFAULT_INIT));
         assert_eq!(p.init_args, ["boot"]);
+        // No unlock device named: the boot is passphrase-only.
+        assert!(!p.fido2);
+        assert_eq!(p.token, None);
+    }
+
+    #[test]
+    fn parse_cmdline_reads_the_unlock_device() {
+        // The FIDO2 flag is a bare token; the token path takes a value.
+        let p = parse_cmdline("ro horizon.fido2 horizon.token=/run/token console=tty0");
+        assert!(p.fido2);
+        assert_eq!(p.token, Some(PathBuf::from("/run/token")));
+
+        // Each is optional and independent.
+        let p = parse_cmdline("horizon.token=/k");
+        assert!(!p.fido2);
+        assert_eq!(p.token, Some(PathBuf::from("/k")));
+    }
+
+    // The authenticator the initramfs builds from the boot params: a token file yields a
+    // software authenticator that opens an enrolled keyslot back to its master, no flags
+    // yield none (a passphrase-only boot), and a malformed token is a surfaced error, not
+    // a silent fallback. This is the init-side mirror of boot's unlock_uses_the_token test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authenticator_builds_a_token_that_opens_its_keyslot() {
+        use identity::{enroll, Keyslots};
+
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("token");
+        let seed = [5u8; 32];
+        std::fs::write(&token_path, seed).unwrap();
+
+        // A keyslot enrolled against the same seed and a known master.
+        let master = [9u8; 32];
+        let mut enroller = identity::SoftwareAuthenticator::new(seed);
+        let mut slots = Keyslots::new();
+        slots.add(enroll(&mut enroller, &master).unwrap());
+
+        // The authenticator the params build opens that slot back to the master.
+        let params = Params {
+            token: Some(token_path),
+            ..Params::default()
+        };
+        let mut auth = authenticator(&params)
+            .unwrap()
+            .expect("a token yields an authenticator");
+        assert_eq!(slots.unlock_any(&mut *auth).unwrap(), master);
+
+        // No device named: no authenticator, so the unlock uses the passphrase.
+        assert!(authenticator(&Params::default()).unwrap().is_none());
+
+        // A token that is not 32 bytes is an error the operator sees, not a silent
+        // fall-through to the passphrase (they named a token they meant to use).
+        let bad = dir.path().join("bad");
+        std::fs::write(&bad, b"short").unwrap();
+        let bad_params = Params {
+            token: Some(bad),
+            ..Params::default()
+        };
+        assert!(authenticator(&bad_params).is_err());
     }
 
     #[test]

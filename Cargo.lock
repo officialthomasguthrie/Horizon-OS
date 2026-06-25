@@ -1268,6 +1268,7 @@ name = "init"
 version = "0.0.0"
 dependencies = [
  "boot",
+ "identity",
  "libc",
  "nix",
  "tempfile",

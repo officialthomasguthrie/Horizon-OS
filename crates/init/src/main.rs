@@ -158,7 +158,7 @@ fn run() -> init::Result<()> {
                 // layer with it. If the store cannot unlock, the boot fails here rather
                 // than assembling a root over a layer it could not decrypt.
                 if want_home {
-                    let master = recover_master(&store)?;
+                    let master = recover_master(&store, &params)?;
                     let dev = home_dev
                         .as_ref()
                         .expect("home_wanted implies a Home device");
@@ -200,15 +200,18 @@ fn run() -> init::Result<()> {
 }
 
 // Recover the 32-byte identity master from the store, the same key that opens the
-// encrypted Home layer. No authenticator is wired into the initramfs yet, so the master
-// is recovered from the console passphrase; a FIDO2 key at the initramfs (identity's
-// HardwareKey behind the fido2 feature, the touch-to-boot path) is a later refinement. The
-// recovered master is handed to horizon boot (stash_master) so the session does not unlock
-// a second time after the pivot.
+// encrypted Home layer. The initramfs builds an authenticator from the kernel command
+// line (a FIDO2 security key for horizon.fido2, a software token for horizon.token, or
+// none), and boot::unlock tries the keyslot that authenticator opens first, falling
+// back to the console passphrase when no key is present or none matches. This is the
+// touch-to-boot path at the initramfs: a touch (or a presented token) recovers the
+// master with no passphrase typed. The recovered master is handed to horizon boot
+// (stash_master) so the session does not unlock a second time after the pivot.
 #[cfg(target_os = "linux")]
-fn recover_master(store: &std::path::Path) -> init::Result<[u8; 32]> {
-    let (master, method) =
-        boot::unlock(store, None, read_passphrase).map_err(|e| init::Error::Boot(e.to_string()))?;
+fn recover_master(store: &std::path::Path, params: &init::Params) -> init::Result<[u8; 32]> {
+    let mut auth = init::authenticator(params)?;
+    let (master, method) = boot::unlock(store, auth.as_deref_mut(), read_passphrase)
+        .map_err(|e| init::Error::Boot(e.to_string()))?;
     eprintln!(
         "horizon-init: unlocked the Home layer via {}",
         method.label()

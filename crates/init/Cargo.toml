@@ -21,6 +21,19 @@ path = "src/main.rs"
 
 [dependencies]
 thiserror.workspace = true
+# Build the authenticator the initramfs recovers the master through (a software token,
+# or a FIDO2 key under the fido2 feature). The crate without its fido2 feature is pure
+# Rust and builds on every host (the authenticator selection is used only on the Linux
+# init path), so it is a plain dependency, which also lets the feature below refer to
+# it on all targets.
+identity = { path = "../identity" }
+
+# The FIDO2 touch-to-boot path: building it links identity's USB-HID FIDO2 backend
+# (ctap-hid-fido2 -> hidapi -> libudev) into the initramfs init. Off by default, so a
+# plain Key build stays passphrase/software-token only and pulls no extra system
+# libraries; turn it on for a Key that recovers the master from a security key.
+[features]
+fido2 = ["identity/fido2"]
 
 # Assembling the root is Linux kernel work (mount, overlayfs, switch_root). On other
 # hosts the crate still compiles (so the workspace builds on darwin) but the executor

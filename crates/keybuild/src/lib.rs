@@ -208,6 +208,13 @@ pub struct KeySpec {
     /// closure. Uses `kernel_version`/`modules_root` like the base modules. Empty installs
     /// none; a module-free kernel (everything built in) needs no initramfs modules.
     pub initramfs_modules: Vec<String>,
+    /// Host files or trees to stage verbatim into the initramfs, each copied from its `src`
+    /// to its `dst` (see [`Stage`]), like `staged` but into the initramfs rather than the
+    /// base. The initramfs is RAM the kernel unpacks and the switch_root discards, so a
+    /// secret staged here (a software token seed that recovers the master) never lands on
+    /// the Key's disk. Empty stages nothing. Unlike `initramfs_bins`, no closure is computed:
+    /// this is plain data, not a binary.
+    pub initramfs_files: Vec<Stage>,
     /// The kernel image (vmlinuz/bzImage) to write into the ESP at [`ESP_KERNEL`]. An external
     /// artifact (fetched or cross-compiled), so it is a host path like `init_bin`. `Some`
     /// together with `bootloader` makes [`build_esp`] lay a bootable ESP; both `None` lays the
@@ -265,6 +272,7 @@ impl KeySpec {
             init_bin: None,
             initramfs_bins: Vec::new(),
             initramfs_modules: Vec::new(),
+            initramfs_files: Vec::new(),
             kernel: None,
             bootloader: None,
             esp_efi: Vec::new(),
@@ -748,6 +756,13 @@ pub fn build_initramfs(spec: &KeySpec) -> Result<PathBuf> {
             version,
             &spec.initramfs_modules,
         )?;
+    }
+
+    // Plain data staged into the initramfs (no closure): a software token seed the init
+    // recovers the master from, which the switch_root then discards with the rest of the
+    // initramfs, so it never reaches the Key's disk.
+    for s in &spec.initramfs_files {
+        populate_staged(&staging, s)?;
     }
 
     // Import the staging tree into a cpio archive, then add the device nodes a staging
@@ -3263,6 +3278,15 @@ mod linux_tests {
         spec.modules_root = modsrc.clone();
         spec.initramfs_modules = vec!["squashfs".to_string()];
 
+        // A software token seed staged into the initramfs as plain data: it must land at its
+        // destination with its bytes intact, the carrier the FIDO2/token boot is eye-verified with.
+        let token = dir.path().join("token.key");
+        std::fs::write(&token, [7u8; 32]).unwrap();
+        spec.initramfs_files = vec![Stage {
+            src: token.clone(),
+            dst: PathBuf::from("/horizon-token"),
+        }];
+
         let img = match build_initramfs(&spec) {
             Ok(p) => p,
             Err(Error::Missing(t)) => {
@@ -3346,6 +3370,18 @@ mod linux_tests {
             ),
             "the emitted modules.dep must be on the initramfs"
         );
+        // The staged token landed at its destination with its bytes intact, and was packed as
+        // plain data (no closure, no /usr/sbin), so the init can read the seed it recovers with.
+        match find("horizon-token").expect("staged token present") {
+            cpio::Entry::File { data, .. } => {
+                assert_eq!(
+                    *data,
+                    vec![7u8; 32],
+                    "the staged token bytes must be intact"
+                )
+            }
+            other => panic!("the staged token should be a file, got {other:?}"),
+        }
         // The console device node, so horizon-init's output is visible before devtmpfs.
         match find("dev/console").expect("/dev/console present") {
             cpio::Entry::Device {

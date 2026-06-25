@@ -31,7 +31,9 @@
 // --initramfs builds the initramfs (initramfs.img, a gzip newc cpio) with
 // /init from --init-bin (horizon-init), each --initramfs-bin (cryptsetup) under /usr/sbin, and
 // each --initramfs-module under /lib/modules/<kver>, all with their shared-library / modules.dep
-// closures; it is built before the ESP so a bootable ESP can write it in.
+// closures, plus each --initramfs-file <src[:dst]> as plain data (a software token seed the init
+// recovers the master from, discarded with the initramfs at switch_root so it never hits disk);
+// it is built before the ESP so a bootable ESP can write it in.
 // --mode <auto|home|ghost> sets the default boot mode baked into the loader's kernel command
 // line (default auto: Home if a data device is present, else Ghost), so a Ghost-only Key boots
 // without a horizon.mode= override.
@@ -60,6 +62,7 @@ struct Args {
     init_bin: Option<PathBuf>,
     initramfs_bins: Vec<PathBuf>,
     initramfs_modules: Vec<String>,
+    initramfs_files: Vec<keybuild::Stage>,
     kernel: Option<PathBuf>,
     bootloader: Option<PathBuf>,
     esp_efi: Vec<PathBuf>,
@@ -79,7 +82,7 @@ fn main() -> ExitCode {
              [--home --home-keyfile <32-byte-master>] \
              [--provision-store <store-dir>] [--data-seed <dir>] [--esp] [--disk] \
              [--initramfs --init-bin <path> [--initramfs-bin <path>]... \
-             [--initramfs-module <name>]...] \
+             [--initramfs-module <name>]... [--initramfs-file <src[:dst]>]...] \
              [--kernel <path> --bootloader <path> [--esp-efi <path>]... \
              [--loader-timeout <secs>] [--cmdline <token>]...] \
              [--mode <auto|home|ghost>]"
@@ -102,6 +105,7 @@ fn main() -> ExitCode {
     spec.init_bin = parsed.init_bin;
     spec.initramfs_bins = parsed.initramfs_bins;
     spec.initramfs_modules = parsed.initramfs_modules;
+    spec.initramfs_files = parsed.initramfs_files;
     spec.kernel = parsed.kernel;
     spec.bootloader = parsed.bootloader;
     spec.esp_efi = parsed.esp_efi;
@@ -222,10 +226,11 @@ fn main() -> ExitCode {
             if initramfs {
                 match keybuild::build_initramfs(&spec) {
                     Ok(p) => println!(
-                        "initramfs: built {} (gzip newc cpio: /init plus {} tool(s), {} module(s))",
+                        "initramfs: built {} (gzip newc cpio: /init plus {} tool(s), {} module(s), {} file(s))",
                         p.display(),
                         spec.initramfs_bins.len(),
-                        spec.initramfs_modules.len()
+                        spec.initramfs_modules.len(),
+                        spec.initramfs_files.len()
                     ),
                     Err(e) => {
                         eprintln!("horizon-keybuild: initramfs: {e}");
@@ -312,6 +317,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut init_bin = None;
     let mut initramfs_bins = Vec::new();
     let mut initramfs_modules = Vec::new();
+    let mut initramfs_files = Vec::new();
     let mut kernel = None;
     let mut bootloader = None;
     let mut esp_efi = Vec::new();
@@ -340,6 +346,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--init-bin" => init_bin = Some(PathBuf::from(it.next()?)),
             "--initramfs-bin" => initramfs_bins.push(PathBuf::from(it.next()?)),
             "--initramfs-module" => initramfs_modules.push(it.next()?.clone()),
+            "--initramfs-file" => initramfs_files.push(parse_stage(it.next()?)?),
             "--kernel" => kernel = Some(PathBuf::from(it.next()?)),
             "--bootloader" => bootloader = Some(PathBuf::from(it.next()?)),
             "--esp-efi" => esp_efi.push(PathBuf::from(it.next()?)),
@@ -376,6 +383,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         init_bin,
         initramfs_bins,
         initramfs_modules,
+        initramfs_files,
         kernel,
         bootloader,
         esp_efi,

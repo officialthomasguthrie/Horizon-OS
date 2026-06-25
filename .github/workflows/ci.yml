@@ -77,3 +77,9 @@ jobs:
       # portable keyslot core (the default build) is tested by `cargo test --all`.
       - run: cargo clippy -p identity --all-targets --features fido2 -- -D warnings
       - run: cargo clippy -p horizon --all-targets --features identity-fido2 -- -D warnings
+      # The initramfs touch-to-boot path: `init`'s `fido2` feature wires identity's
+      # HardwareKey into horizon-init so a security key recovers the master at boot.
+      # It pulls the same libudev-linked hidraw backend, runs on real hardware, and
+      # otherwise must keep compiling; the default build (passphrase + software token)
+      # is tested by `cargo test --all`.
+      - run: cargo clippy -p init --all-targets --features fido2 -- -D warnings

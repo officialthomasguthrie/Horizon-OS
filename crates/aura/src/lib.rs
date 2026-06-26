@@ -14,6 +14,7 @@
 
 mod error;
 mod plan;
+mod semantic;
 mod tool;
 
 use std::collections::HashMap;
@@ -22,6 +23,10 @@ use weave::{Broker, Capability, GrantId, Limits, PrincipalId, Resource, Rights, 
 
 pub use error::{Error, Result};
 pub use plan::{Plan, Planner, RulePlanner, Step};
+pub use semantic::{
+    dot, normalize, Embedder, HashingEmbedder, Hit, SemanticIndex, VectorIndex, DEFAULT_DIM,
+    INDEX_REF,
+};
 pub use tool::{Args, Catalog, Effect, Need, Outcome, ParamSpec, Tool};
 
 // The name Aura acts under in the audit log. Everything it does shows up as this

@@ -7,15 +7,23 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use weave::{Lease, Resource, Rights};
 
 use crate::error::{Error, Result};
+use crate::semantic::{dot, Embedder, HashingEmbedder};
 
 // How much of a file `read_file` returns and how far `find` descends, so a tool
 // on a huge tree stays bounded.
 const READ_CAP: usize = 64 * 1024;
 const FIND_DEPTH: usize = 8;
+// How many ranked matches `find` returns at most, and the cosine floor below
+// which a file is considered unrelated to the query (a file sharing no terms
+// with it scores 0 and is dropped, which keeps the lexical-grade precision the
+// substring search had while adding meaning-based ranking on top).
+const FIND_LIMIT: usize = 50;
+const FIND_FLOOR: f32 = 0.0;
 
 // Effect classes drive the safety rails. A Read tool runs once its capability is
 // held; a Write tool mutates (reversible through a Lifestream snapshot); a
@@ -161,7 +169,9 @@ impl Catalog {
         let mut c = Catalog::empty();
         c.add(Box::new(ListDir));
         c.add(Box::new(ReadFile));
-        c.add(Box::new(Find));
+        c.add(Box::new(Find {
+            embedder: Arc::new(HashingEmbedder::default()),
+        }));
         c.add(Box::new(MoveFile));
         c.add(Box::new(DeleteFile));
         c
@@ -295,15 +305,26 @@ impl Tool for ReadFile {
     }
 }
 
-// find: files under a directory whose name or text contents match a query, the
-// lexical stand-in for the semantic search the embedding index brings later.
-struct Find;
+// find: files under a directory ranked by how well their name and contents match
+// a query by MEANING, not substring. It embeds the query and each candidate file
+// and ranks by cosine, returning the closest first and dropping files with no
+// overlap. The embedding model is the gated seam (see `semantic`); the default
+// `HashingEmbedder` makes this run and be tested without one.
+//
+// This ranks the directory live on every call, which is fine for the default
+// embedder but is the reason a standing `SemanticIndex` exists: a real model
+// embeds once at index time, and `find` then queries that index instead of
+// re-embedding the tree. Same capability either way (READ on the directory),
+// which is what still bounds the results.
+struct Find {
+    embedder: Arc<dyn Embedder>,
+}
 impl Tool for Find {
     fn name(&self) -> &'static str {
         "find"
     }
     fn description(&self) -> &'static str {
-        "find files under a directory by name or contents (lexical)"
+        "find files under a directory by meaning (semantic ranking)"
     }
     fn params(&self) -> &'static [ParamSpec] {
         &[
@@ -314,7 +335,7 @@ impl Tool for Find {
             },
             ParamSpec {
                 name: "query",
-                description: "the text to match",
+                description: "what to look for, in your own words",
                 required: true,
             },
         ]
@@ -330,31 +351,43 @@ impl Tool for Find {
     }
     fn run(&self, args: &Args, _leases: &[Lease]) -> Result<Outcome> {
         let dir = path_arg(args, "dir")?;
-        let query = args.require("query")?.to_lowercase();
-        let mut hits = Vec::new();
+        let query = self.embedder.embed(args.require("query")?);
+        let mut scored: Vec<(f32, String)> = Vec::new();
         walk(&dir, FIND_DEPTH, &mut |p: &PathBuf| {
-            let name_match = p
-                .file_name()
-                .map(|n| n.to_string_lossy().to_lowercase().contains(&query))
-                .unwrap_or(false);
-            let body_match = !name_match
-                && fs::read(p)
-                    .ok()
-                    .map(|b| {
-                        let take = b.len().min(READ_CAP);
-                        String::from_utf8_lossy(&b[..take])
-                            .to_lowercase()
-                            .contains(&query)
-                    })
-                    .unwrap_or(false);
-            if name_match || body_match {
-                hits.push(p.to_string_lossy().into_owned());
+            let score = dot(&query, &self.embedder.embed(&doc_text(p)));
+            if score > FIND_FLOOR {
+                scored.push((score, p.to_string_lossy().into_owned()));
             }
         })
         .map_err(Error::io)?;
-        hits.sort();
-        Ok(Outcome::Matches(hits))
+        // Best score first; ties fall back to path order for a stable result.
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        scored.truncate(FIND_LIMIT);
+        Ok(Outcome::Matches(
+            scored.into_iter().map(|(_, p)| p).collect(),
+        ))
     }
+}
+
+// The text a file is embedded as: its name plus a capped slice of its contents,
+// so both what it is called and what it says contribute to the match.
+fn doc_text(path: &PathBuf) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let body = fs::read(path)
+        .ok()
+        .map(|b| {
+            let take = b.len().min(READ_CAP);
+            String::from_utf8_lossy(&b[..take]).into_owned()
+        })
+        .unwrap_or_default();
+    format!("{name}\n{body}")
 }
 
 fn walk(dir: &PathBuf, depth: usize, f: &mut impl FnMut(&PathBuf)) -> std::io::Result<()> {
@@ -452,5 +485,52 @@ impl Tool for DeleteFile {
         let path = path_arg(args, "path")?;
         fs::remove_file(&path).map_err(Error::io)?;
         Ok(Outcome::Deleted(path.to_string_lossy().into_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_ranks_relevant_files_and_drops_unrelated() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("cattle.md"),
+            "grazing rotations from spring: moving the cows between paddocks",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("pasture.txt"),
+            "spring pasture notes for the cows",
+        )
+        .unwrap();
+        fs::write(
+            d.path().join("taxes.md"),
+            "quarterly budget spreadsheet figures",
+        )
+        .unwrap();
+
+        let find = Find {
+            embedder: Arc::new(HashingEmbedder::default()),
+        };
+        let args = Args::new()
+            .with("dir", d.path().to_string_lossy())
+            .with("query", "where do the cows graze");
+        // The built-in tools re-open by path, so no lease is needed in the test.
+        match find.run(&args, &[]).unwrap() {
+            Outcome::Matches(ms) => {
+                assert!(!ms.is_empty(), "the cattle notes should match");
+                assert!(
+                    ms.iter().all(|m| !m.ends_with("taxes.md")),
+                    "the unrelated file is dropped, got {ms:?}"
+                );
+                assert!(
+                    ms[0].ends_with("cattle.md") || ms[0].ends_with("pasture.txt"),
+                    "a cattle file ranks first, got {ms:?}"
+                );
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
     }
 }

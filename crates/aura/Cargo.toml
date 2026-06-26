@@ -10,8 +10,8 @@ repository.workspace = true
 
 [dependencies]
 weave = { path = "../weave" }
+lifestream = { path = "../lifestream" }
 thiserror.workspace = true
 
 [dev-dependencies]
-lifestream = { path = "../lifestream" }
 tempfile.workspace = true

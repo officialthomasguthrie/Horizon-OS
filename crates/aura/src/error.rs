@@ -15,6 +15,10 @@ pub enum Error {
     Io(String),
     #[error("weave: {0}")]
     Weave(#[from] weave::Error),
+    #[error("lifestream: {0}")]
+    Lifestream(String),
+    #[error("malformed index: {0}")]
+    Index(&'static str),
     #[error("planning failed: {0}")]
     Plan(String),
 }
@@ -22,6 +26,9 @@ pub enum Error {
 impl Error {
     pub fn io(e: impl fmt::Display) -> Error {
         Error::Io(e.to_string())
+    }
+    pub fn lifestream(e: impl fmt::Display) -> Error {
+        Error::Lifestream(e.to_string())
     }
 }
 

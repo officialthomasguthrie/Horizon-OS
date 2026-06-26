@@ -381,6 +381,26 @@ enum AuraOp {
         /// The intent, e.g. "find cows in /home/me/docs"
         intent: Vec<String>,
     },
+    /// Build a semantic index over a directory and persist it inside a store's
+    /// Lifestream (encrypted at rest, referenced so it survives gc). The
+    /// embedding model is the gated seam; the deterministic stand-in indexes here
+    Index {
+        /// The store to keep the index in
+        store: PathBuf,
+        /// The directory whose files to index
+        dir: PathBuf,
+    },
+    /// Search the persisted semantic index by meaning, printing ranked hits with
+    /// their relevance score and a snippet
+    Search {
+        /// The store holding the index
+        store: PathBuf,
+        /// What to look for, in your own words
+        query: Vec<String>,
+        /// How many hits to show
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
     /// Run a scripted end-to-end story: an intent becomes a plan, the missing
     /// capabilities are surfaced (never silently acquired), you approve, it runs
     /// through the broker (every access audited), and a destructive step waits for
@@ -725,8 +745,98 @@ fn aura_cmd(op: AuraOp) -> Result<()> {
             Ok(())
         }
         AuraOp::Plan { intent } => aura_plan(&intent.join(" ")),
+        AuraOp::Index { store, dir } => aura_index(&store, &dir),
+        AuraOp::Search {
+            store,
+            query,
+            limit,
+        } => aura_search(&store, &query.join(" "), limit),
         AuraOp::Demo => aura_demo(),
     }
+}
+
+// Build the semantic index over `dir` and persist it into the store. Every
+// regular file under the directory is embedded under its path; the index is a
+// single Lifestream object referenced by name, so it is encrypted at rest and
+// reachable for gc exactly like the Weave audit log.
+fn aura_index(store: &Path, dir: &Path) -> Result<()> {
+    let ls = open(store)?;
+    let mut index = aura::SemanticIndex::new(aura::HashingEmbedder::default());
+    let mut count = 0usize;
+    index_dir(dir, &mut |path, text| {
+        index.add(path.to_string_lossy(), &text);
+        count += 1;
+    })?;
+    let id = index
+        .save(&ls, aura::INDEX_REF)
+        .map_err(|e| anyhow!("{e}"))?;
+    println!(
+        "indexed {count} file(s) under {} into {} ({})",
+        dir.display(),
+        store.display(),
+        id.to_hex()
+    );
+    Ok(())
+}
+
+// Query the persisted index and print the ranked hits.
+fn aura_search(store: &Path, query: &str, limit: usize) -> Result<()> {
+    let ls = open(store)?;
+    let index = aura::SemanticIndex::load(aura::HashingEmbedder::default(), &ls, aura::INDEX_REF)
+        .map_err(|e| anyhow!("{e}"))?;
+    if index.is_empty() {
+        println!(
+            "the index is empty; run `horizon aura index {} <dir>` first",
+            store.display()
+        );
+        return Ok(());
+    }
+    let hits = index.query(query, limit);
+    if hits.is_empty() {
+        println!(
+            "no matches for {query:?} among {} indexed file(s)",
+            index.len()
+        );
+        return Ok(());
+    }
+    println!("query:  {query:?}  ({} indexed)\n", index.len());
+    for h in &hits {
+        println!("  {:.3}  {}", h.score, h.id);
+        if !h.snippet.is_empty() {
+            println!("         {}", h.snippet);
+        }
+    }
+    Ok(())
+}
+
+// Walk a directory to a bounded depth, handing each regular file's path and a
+// capped slice of its text to `f`. Unreadable files are skipped, not fatal.
+fn index_dir(dir: &Path, f: &mut impl FnMut(&Path, String)) -> Result<()> {
+    fn walk(dir: &Path, depth: usize, f: &mut impl FnMut(&Path, String)) -> Result<()> {
+        if depth == 0 {
+            return Ok(());
+        }
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, depth - 1, f)?;
+            } else if let Ok(bytes) = std::fs::read(&p) {
+                let take = bytes.len().min(64 * 1024);
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                // Name appended (not prepended) so the embedding still carries it
+                // but the snippet shows the file's first line of content.
+                let text = format!("{}\n{name}", String::from_utf8_lossy(&bytes[..take]));
+                f(&p, text);
+            }
+        }
+        Ok(())
+    }
+    walk(dir, 8, f)
 }
 
 // A throwaway store and broker under the temp dir, for the self-contained Aura
@@ -852,9 +962,63 @@ fn aura_demo_inner(dir: &Path, broker: &mut Broker) -> Result<()> {
     print_aura_report(&aura.execute(&plan, true));
     println!();
 
+    // 5. Semantic search: find by MEANING, not substring. The same files,
+    //    embedded into a vector index, are ranked against a natural-language
+    //    query. The embedding model is the gated seam; the deterministic stand-in
+    //    ranks here (so it goes on overlap, not true synonymy), and a real model
+    //    drops into the same `Embedder` to make "cows" reach "cattle".
+    println!("# semantic search: rank files by meaning (the find tool uses this)");
+    let mut index = aura::SemanticIndex::new(aura::HashingEmbedder::default());
+    for entry in walkdir(&work) {
+        if let Ok(bytes) = std::fs::read(&entry) {
+            let name = entry
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            index.add(
+                entry
+                    .strip_prefix(&work)
+                    .unwrap_or(&entry)
+                    .to_string_lossy(),
+                &format!("{}\n{name}", String::from_utf8_lossy(&bytes)),
+            );
+        }
+    }
+    let q = "that thing about where the cows graze";
+    println!("query:  {q:?}  ({} files indexed)", index.len());
+    for h in index.query(q, 3) {
+        println!("  {:.3}  {}  -- {}", h.score, h.id, h.snippet);
+    }
+    println!();
+
     println!("# audit log (the Glass stand-in)");
     print_audit(aura.broker())?;
     Ok(())
+}
+
+// The regular files under a directory, to a bounded depth, for the demo's
+// in-memory index.
+fn walkdir(dir: &Path) -> Vec<PathBuf> {
+    fn go(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth == 0 {
+            return;
+        }
+        let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+            Ok(e) => e.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
+            Err(_) => return,
+        };
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                go(&p, depth - 1, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    go(dir, 8, &mut out);
+    out
 }
 
 fn print_aura_preview(pv: &aura::Preview) {

@@ -1772,6 +1772,45 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   + vector search over the Lifestream), and Aura as the Glass desktop's command palette (the
   `glass::aura` line already parses launch/sever/filter; this is the general intent->capability core
   it grows into).
+- Phase 4 Aura semantic search (`aura` crate + `horizon`): `find` now matches by MEANING, not
+  substring, the docs/05 semantic-memory capability ("that thing about where the cows graze"). It
+  is built on the same headless split as the rest of the AI layer: the embedding MODEL is the
+  weights-gated shim that plugs into the new `Embedder` seam later (EmbeddingGemma over llama.cpp,
+  the same engine the planner backend will use, eye-verified on hardware), while the vector index,
+  the cosine ranking, and the persistence are pure code, owned and proven without a model. Three
+  pieces in a new `semantic` module. (1) The `Embedder` seam (text -> an L2-normalized vector) with
+  a deterministic default, `HashingEmbedder`: the hashing trick over word tokens and their
+  character trigrams, with a small stopword list, into a fixed 1024-wide vector. It is the dev and
+  test seam, the analog of the `RulePlanner` and identity's `SoftwareAuthenticator`: it ranks on
+  lexical overlap (it will not tie "cows" to "cattle"; that quality leap is exactly what the real
+  model brings when it fills the seam), but it exercises the whole index and ranking pipeline end to
+  end, and it is deterministic (a fixed FNV-1a, not the std hasher) because a persisted index is
+  only valid if the same text embeds the same way on every run. (2) A `VectorIndex`: a flat
+  embeddings store searched by brute-force cosine (the docs/05 sqlite-vec approach at small scale;
+  an approximate HNSW index is the swap-in beyond ~100k vectors, behind the same API), with its own
+  compact binary encode/decode owned in pure Rust like the gpt/fat/cpio formats, so it persists
+  without dragging in serde; top-k, best-first, ties broken by id, a min-score floor that drops
+  non-overlapping documents (which keeps the lexical-grade precision the substring `find` had while
+  adding ranking on top). (3) A `SemanticIndex` tying an embedder to the index plus persistence
+  INTO the Lifestream: `save` writes the encoded index as one content-addressed object and points a
+  ref at it, `load` rebuilds it, so the index is encrypted at rest and reachable for gc exactly like
+  the Weave audit log. This is the "vector index over the Lifestream": the store both holds the
+  documents and carries the index of them. The `find` tool is rewired to this: it embeds the query
+  and each candidate under the capability-scoped directory and ranks by cosine, best first, dropping
+  files with no overlap; the capability (READ on the directory) is unchanged and still bounds the
+  results, and re-ranking the tree live is exactly why a standing `SemanticIndex` exists (a real
+  model embeds once at index time and `find` queries that index instead). Proven headlessly on
+  darwin: 23 aura tests (normalize/cosine, embedder determinism across instances, related text
+  outranks unrelated, index search ordering + k cap + min-score drop, add-replaces/remove,
+  encode/decode roundtrip + garbage rejection, semantic query end to end, persistence roundtrip
+  through a real Lifestream, empty-on-no-ref, width-mismatch refusal, and the find tool ranking the
+  relevant files and dropping the unrelated one). CLI: `horizon aura index <store> <dir>` builds and
+  persists the index into a store's Lifestream and `horizon aura search <store> <query>` queries it
+  with ranked scores and snippets (verified end to end: "where do the cows graze" -> the cattle note,
+  "budget and taxes" -> the finance note, each search a fresh process loading the saved index), and
+  `aura demo` gained a semantic-search beat ranking the demo files by a natural-language query.
+  Next on the AI layer: drop a real embedding model into the `Embedder` seam (the GGUF shim, shared
+  with the llama.cpp planner backend), and Aura as the Glass desktop's command palette.
 
 ## Next
 
